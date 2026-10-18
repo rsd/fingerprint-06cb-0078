@@ -1,0 +1,7 @@
+# makepkg output when building in this directory
+/src/
+/pkg/
+/libfprint/
+*.pkg.tar.*
+*.log
+/fp0078/

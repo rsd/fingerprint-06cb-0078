@@ -1,0 +1,2596 @@
+#!/usr/bin/python3 -IB
+# SPDX-License-Identifier: MIT
+"""Set up the libfprint synaptics0078 driver (Synaptics 06cb:0078 reader) without Windows.
+
+The driver reads two kinds of files from /var/lib/fprint/synaptics0078 each time
+fprintd opens the reader:
+
+  module.bin              10500 bytes, the vendor's sensor module (sha256-pinned)
+  program-<serial>.bin    18869 bytes, first byte 0x02: the capture program built
+                          from this unit's calibration; <serial> is 12 lowercase hex
+
+Commands (research/steps/b5-setup-design.md, "Proposed command line"):
+
+  install                 whatever is missing: the vendor files (from the cache in
+                          /var/lib/synaptics0078/vendor, else downloaded), the
+                          calibration of this reader, the two data files. A valid
+                          module plus a valid program for this reader is "already
+                          set up": no download, no calibration.
+  install --from-file F   the vendor files from F instead (cab, zip, setup exe, MSI,
+                          DLL, bare module, bare template; repeatable)
+  install --from DIR      phase A: copy files made on Windows (unchanged, below)
+  recalibrate             calibrate again; the previous program is kept under
+                          /var/lib/synaptics0078/backup/
+  fetch [--from-file F]   the vendor files into the cache only; no reader needed
+  status                  module, programs (matched against the reader in sysfs),
+                          cache, last calibration, the source URLs; exit 0 ready, 1 not
+  common options          --dry-run (change nothing; no root needed), --yes (no Enter
+                          prompt: a 3-second countdown instead)
+
+It runs as root. Python is started with `-IB` (no PYTHONPATH, no user site, no script
+or current directory on the import path, no bytecode written). The tool itself uses
+the standard library only; the shared code (synaptics0078: pins, template, vendor
+extraction, the guarded USB session) is loaded from /usr/lib/synaptics0078 only after
+every directory from / down to the package, and every file in it, is checked to be a
+real directory or regular file owned by root and not writable by group or others. It
+is loaded by its file location, not through sys.path. pyusb is imported only when a
+real USB session opens.
+
+Vendor files are untrusted. Downloads use curl with an exact argv (https only, size
+and time caps, `-q` first so no curlrc is read) into a private temporary file in the
+root-only cache directory, then are read once with a cap. An archive whose sha256 is
+one of the known archives (synaptics0078.pins.ARCHIVES) is parsed in this process;
+anything else (a re-signed cab, a --from-file that is not a bare module or template)
+is parsed in a child started as nobody:
+
+  setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \\
+      prlimit --as=1073741824 --cpu=120 --nproc=64 --fsize=0 -- \\
+      /usr/bin/python3 -IB -c "<load the checked package; vendor.child_entry()>"
+
+with the archive on stdin, in a session of its own (no controlling terminal); its
+framed output is read with a size cap and a timeout, and every pin is applied again here. Nothing downloaded is executed; no archive member
+name becomes a path. The module pin and the template pin are the gates.
+
+Calibration (design decision 9): the reader is found in sysfs before any download;
+fprintd is stopped if it is active (it restarts on demand); the interface is claimed
+(on busy: stop fprintd once more, wait 1 s, retry once); fingers off; the calibration
+sequence of synaptics0078.session runs with its command guard and the pins; a check
+score above 200 or a baseline out of range asks to lift the fingers and retry (3 tries).
+The serial comes from RomInfo, as the driver derives it, and must equal the sysfs USB
+serial. No module loaded (RomInfo byte 17 == 0): the sequence uploads it; any module
+other than ours loaded: refused ("restart the computer").
+
+The log is /var/log/synaptics0078-setup.log (root, 0600), with the serial replaced by
+<serial>; the terminal gets the short steps only. calibration.json beside the backups
+(/var/lib/synaptics0078) records the date, the check score, the baseline statistics,
+the tool version and the template pin, never the serial.
+
+Phase A source (install --from DIR): a directory the user prepared with
+tools/synaptics0078_data.py from the fingerprint-06cb-0078 project (it needs the
+Windows driver files). The source files are opened without following symlinks, must
+be regular files of the exact size, are read once, checked in memory, and those same
+bytes are written. Run through sudo (SUDO_UID set), the source directory and every data
+file in it, like every --from-file, must belong to the user who ran sudo: anything else
+is refused before it is listed or read, so the tool cannot be used to look into another
+user's or root's files. Run from a real root shell (no SUDO_UID) the owner is not
+checked, and the tool says so.
+
+Test hooks (never set them on a real system; honoured only when not running as
+root, and as root the tool refuses to run while any of them is set):
+  SYNAPTICS0078_SETUP_TEST_ROOT           prefix for every system path; no root
+                                          needed, no chown, the owner checked is
+                                          the test user. The package is then loaded
+                                          from the checkout this script is in
+  SYNAPTICS0078_SETUP_TEST_MODULE_SHA256  the module.bin sha256 to accept
+                                          (synthetic test data); without a pins file
+                                          the programs' content is then not checked
+                                          against the template (phase A test data)
+  SYNAPTICS0078_SETUP_TEST_EUID           the euid the root guard above sees
+  SYNAPTICS0078_SETUP_TEST_PINS           a pins file (synaptics0078.pins.Pins.to_json)
+                                          for synthetic fixtures; also given to the
+                                          unprivileged extractor
+  SYNAPTICS0078_SETUP_TEST_ARCHIVES       a JSON list of archives (the fields of
+                                          pins.Archive) replacing pins.ARCHIVES
+  SYNAPTICS0078_SETUP_TEST_LIBDIR         the directory holding the synaptics0078
+                                          package (default: see TEST_ROOT)
+  SYNAPTICS0078_SETUP_TEST_CURL           the curl to run (default under a test
+  SYNAPTICS0078_SETUP_TEST_SYSTEMCTL      root: the test root's usr/bin/<name>,
+  SYNAPTICS0078_SETUP_TEST_SETPRIV        which normally does not exist)
+  SYNAPTICS0078_SETUP_TEST_PRLIMIT
+  SYNAPTICS0078_SETUP_TEST_SYSFS          the directory standing for /sys (default
+                                          under a test root: its sys/)
+  SYNAPTICS0078_SETUP_TEST_TRANSPORT      a Python file defining make_transport(log,
+                                          guard), returning a fake USB transport (the
+                                          interface of synaptics0078.session.UsbTransport);
+                                          under a test root without it nothing calibrates
+"""
+
+import argparse
+import contextlib
+import dataclasses
+import datetime
+import errno
+import functools
+import grp
+import hashlib
+import importlib
+import importlib.util
+import json
+import os
+import pwd
+import re
+import secrets
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import time
+import traceback
+
+PROG = "synaptics0078-setup"
+TOOL_VERSION = "2.0"  # B5: the Windows-free setup; recorded in calibration.json
+
+MODULE_NAME = "module.bin"
+MODULE_SIZE = 10500
+MODULE_SHA256 = "67f4a332d89f76fe12c57fa7f67b43a076f689e78267b888c694e26b05caacc1"
+PROGRAM_SIZE = 18869
+PROGRAM_OPCODE = 0x02
+SERIAL_RE = re.compile(r"[0-9a-f]{12}")  # always fullmatch: `$` would accept a trailing newline
+PROGRAM_NAME_RE = re.compile(r"program-(.*)\.bin", re.DOTALL)
+
+# /var/lib/fprint is fprintd's StateDirectory (its sandbox can write there and nowhere else).
+STATE_DIR = "/var/lib/fprint"
+DATA_DIR = "/var/lib/fprint/synaptics0078"
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+# This tool's own state (design decision 7): the vendor cache, the backups, calibration.json.
+SETUP_DIR = "/var/lib/synaptics0078"
+VENDOR_NAME, BACKUP_NAME = "vendor", "backup"
+MANIFEST_NAME = "manifest.json"
+CALIBRATION_NAME = "calibration.json"
+LOG_PATH = "/var/log/synaptics0078-setup.log"
+
+LIBDIR = "/usr/lib/synaptics0078"  # holds the package directory synaptics0078/
+PACKAGE = "synaptics0078"
+CURL = "/usr/bin/curl"
+SYSTEMCTL = "/usr/bin/systemctl"
+SETPRIV = "/usr/bin/setpriv"
+PRLIMIT = "/usr/bin/prlimit"  # util-linux, like setpriv
+PYTHON = "/usr/bin/python3"
+SYSFS = "/sys"
+NOBODY = 65534
+READER_IDS = ("06cb", "0078")
+
+# Template pins of earlier packages: an installed program whose fixed part matches one
+# of them is re-spliced into the current template instead of calibrated again (design
+# decision 11). Empty: the template pin has never changed. The pin recorded in
+# calibration.json when a program was written counts too.
+PREVIOUS_TEMPLATE_SHA256: tuple[str, ...] = ()
+
+MAX_ATTEMPTS = 3
+COUNTDOWN_S = 3
+BUSY_WAIT_S = 1
+CHILD_TIMEOUT_S = 300
+# The resource limits of the unprivileged extractor (prlimit sets soft = hard; nobody
+# cannot raise them again). Each is a backstop that makes a hostile archive fail closed
+# (a failed source), well above what a real input needs:
+#   AS 1 GiB    address space; an input is at most vendor.MAX_INPUT (64 MiB), the real
+#               archives at most 32 MiB, and everything one extract() reads out of
+#               containers at most vendor.MAX_TOTAL_BYTES (512 MiB)
+#   CPU 120 s   per process (each bsdtar gets its own); the real archives take seconds,
+#               and it bounds a child the wall-clock CHILD_TIMEOUT_S could not stop
+#               (the root side killed with SIGKILL)
+#   NPROC 64    counted by the kernel per real uid over the whole system, threads
+#               included: the extractor needs 3 (itself, its stdin feeder thread, one
+#               bsdtar at a time), the rest is room for the services that already run
+#               as nobody (13 threads on the development machine); it stops a fork bomb
+#   FSIZE 0     no regular file of any size is written (stdout and stderr are pipes,
+#               which the limit does not cover)
+CHILD_RLIMITS = (("as", 1 << 30), ("cpu", 120), ("nproc", 64), ("fsize", 0))
+SYSTEMCTL_TIMEOUT_S = 60
+# curl's --max-time caps each try, and --retry 2 makes up to 3 tries with
+# --retry-delay seconds between them (decision 5; the argv is curl_argv).
+CURL_RETRIES = 2
+CURL_RETRY_DELAY_S = 2
+CURL_MARGIN_S = 60  # curl's start and exit; not a try
+MAX_SMALL_FILE = 1 << 20  # manifest, calibration.json, pins and archives files
+REDACTED = "<serial>"
+CACHE_NAME_RE = re.compile(r"([0-9a-f]{64})-([a-z0-9][a-z0-9.-]{0,63})")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+PROXY_VARS = ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY")
+
+TEST_ROOT_VAR = "SYNAPTICS0078_SETUP_TEST_ROOT"
+TEST_SHA_VAR = "SYNAPTICS0078_SETUP_TEST_MODULE_SHA256"
+TEST_EUID_VAR = "SYNAPTICS0078_SETUP_TEST_EUID"
+TEST_PINS_VAR = "SYNAPTICS0078_SETUP_TEST_PINS"
+TEST_ARCHIVES_VAR = "SYNAPTICS0078_SETUP_TEST_ARCHIVES"
+TEST_LIBDIR_VAR = "SYNAPTICS0078_SETUP_TEST_LIBDIR"
+TEST_CURL_VAR = "SYNAPTICS0078_SETUP_TEST_CURL"
+TEST_SYSTEMCTL_VAR = "SYNAPTICS0078_SETUP_TEST_SYSTEMCTL"
+TEST_SETPRIV_VAR = "SYNAPTICS0078_SETUP_TEST_SETPRIV"
+TEST_PRLIMIT_VAR = "SYNAPTICS0078_SETUP_TEST_PRLIMIT"
+TEST_SYSFS_VAR = "SYNAPTICS0078_SETUP_TEST_SYSFS"
+TEST_TRANSPORT_VAR = "SYNAPTICS0078_SETUP_TEST_TRANSPORT"
+TEST_VARS = (
+    TEST_ROOT_VAR,
+    TEST_SHA_VAR,
+    TEST_EUID_VAR,
+    TEST_PINS_VAR,
+    TEST_ARCHIVES_VAR,
+    TEST_LIBDIR_VAR,
+    TEST_CURL_VAR,
+    TEST_SYSTEMCTL_VAR,
+    TEST_SETPRIV_VAR,
+    TEST_PRLIMIT_VAR,
+    TEST_SYSFS_VAR,
+    TEST_TRANSPORT_VAR,
+)
+SUDO_UID_VAR = "SUDO_UID"  # set by sudo: the user who ran it (not a test hook)
+
+SOURCE_HINT = (
+    "make the files with tools/synaptics0078_data.py in the fingerprint-06cb-0078 project "
+    "(it needs the Windows driver files); it writes them to local/synaptics0078 there"
+)
+DONE_LINE = f"fprintd reads these files the next time it opens the reader, no restart needed; check with: {PROG} status"
+
+MSG_FOUND = "Fingerprint reader 06cb:0078 found."
+MSG_FINGERS_OFF = "Keep your fingers OFF the reader, then press Enter."
+MSG_TOUCHED = "The reader seemed touched; lift your fingers and press Enter."
+MSG_NOT_FOUND = (
+    "The fingerprint reader 06cb:0078 was not found. Check that it is enabled in the firmware (BIOS) "
+    "setup and connected, then run the same command again."
+)
+MSG_NO_DOWNLOAD = (
+    "Could not download the vendor files from any source. Download one of them yourself "
+    f"({PROG} status lists the URLs) and run: sudo {PROG} install --from-file FILE"
+)
+MSG_BARE_MODULE = (
+    "A bare module alone cannot be calibrated: the calibration also needs the vendor DLL, a vendor "
+    "archive (cab, zip, setup exe, MSI) or the template. Give one of those too, with another --from-file."
+)
+
+_RDONLY = os.O_RDONLY | os.O_CLOEXEC | os.O_NOCTTY
+_DIR_FLAGS = _RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_ENV_MIN = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}
+
+
+class Fail(Exception):
+    """A refusal or error for the user: the message, an optional hint, the exit code."""
+
+    def __init__(self, message: str, hint: str = "", code: int = 1):
+        super().__init__(message)
+        self.hint = hint
+        self.code = code
+
+
+class BadFile(Exception):
+    """A source or installed file that cannot be used; the message says why."""
+
+
+class WrongModule(Exception):
+    """RomInfo byte 17 is neither 0 (no module) nor 0x0e (ours): another module is loaded."""
+
+
+class SerialMismatch(Exception):
+    """The RomInfo serial is not the sysfs USB serial."""
+
+
+# ----------------------------------------------------------------- configuration
+
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    test_root: str  # "" on a real system
+    module_sha256: str
+    expect_uid: int  # owner of the directories: root, or the test user under a test root
+    state_dir: str
+    data_dir: str
+    source_uid: int | None = None  # the owner the source dir and files must have: the sudo user
+    source_unchecked: bool = False  # root (or a test root) without SUDO_UID: the owner is not checked
+    pins_path: str = ""  # test hook: synthetic pins
+    archives_path: str = ""  # test hook: synthetic archives
+    libdir: str = LIBDIR
+    curl: str = CURL
+    systemctl: str = SYSTEMCTL
+    setpriv: str = SETPRIV
+    prlimit: str = PRLIMIT
+    sysfs: str = SYSFS
+    transport_path: str = ""  # test hook: a fake USB transport
+    setup_dir: str = SETUP_DIR
+    log_path: str = LOG_PATH
+    check_template: bool = True  # False only for phase A synthetic test data
+    proxies: tuple[tuple[str, str], ...] = ()  # passed on to curl
+
+
+def source_owner(environ, applies: bool) -> tuple[int | None, bool]:
+    """(the uid the source must belong to, whether its owner goes unchecked).
+
+    It applies to a root run, which can read anything, and to a test root standing
+    in for one. SUDO_UID is sudo's own variable, not a test hook: it only adds a
+    check, and without it a root run reads the source as before and says so.
+    """
+    if not applies:
+        return None, False
+    raw = environ.get(SUDO_UID_VAR, "")
+    if raw == "":
+        return None, True
+    if not (raw.isascii() and raw.isdigit()):
+        raise Fail(f"{SUDO_UID_VAR} is not a number; refusing to guess whose files to read", code=2)
+    return int(raw), False
+
+
+def checkout_libdir() -> str:
+    """The fingerprint-06cb-0078 checkout this script is in (packaging/arch/<pkg>/<script>)."""
+    path = os.path.realpath(__file__)
+    for _ in range(4):
+        path = os.path.dirname(path)
+    return path
+
+
+def _hook_path(environ, var: str, default: str) -> str:
+    value = environ.get(var, "")
+    if value == "":
+        return default
+    if not os.path.isabs(value):
+        raise Fail(f"{var} must be an absolute path", code=2)
+    return value
+
+
+def _pins_module_sha256(path: str) -> str:
+    """The module pin in a pins file (the whole file is checked once the package is loaded)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.loads(fh.read(MAX_SMALL_FILE))
+        value = doc["module_sha256"]
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+        raise Fail(f"{TEST_PINS_VAR}: cannot read a pins document from {path} ({exc})", code=2) from None
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise Fail(f"{TEST_PINS_VAR}: module_sha256 in {path} is not a sha256", code=2)
+    return value
+
+
+def load_config(environ, real_euid: int) -> Config:
+    """The paths and pins to use; the test hooks only when not root.
+
+    As root (or as a test faking root through TEST_EUID) any test variable makes
+    the tool refuse to run: sudo -E or env_keep could otherwise carry one in.
+    """
+    guard_euid = real_euid
+    if real_euid != 0 and environ.get(TEST_EUID_VAR, "") != "":
+        try:
+            guard_euid = int(environ[TEST_EUID_VAR])
+        except ValueError:
+            raise Fail(f"{TEST_EUID_VAR} must be a number", code=2) from None
+    if guard_euid == 0:
+        for var in TEST_VARS:
+            if var in environ:
+                raise Fail(
+                    f"{var} is set; the test-only variables are refused as root",
+                    hint=f"unset it (sudo -E and env_keep pass it on): sudo env -u {var} {PROG} ...",
+                    code=2,
+                )
+    proxies = tuple((k, environ[k]) for k in PROXY_VARS if environ.get(k))
+    if real_euid == 0:  # reached only with no test variable set
+        return Config("", MODULE_SHA256, 0, STATE_DIR, DATA_DIR, *source_owner(environ, True), proxies=proxies)
+    test_root = environ.get(TEST_ROOT_VAR, "")
+    if test_root:
+        if not os.path.isabs(test_root):
+            raise Fail(f"{TEST_ROOT_VAR} must be an absolute path", code=2)
+        test_root = os.path.realpath(test_root)
+    module_sha256 = environ.get(TEST_SHA_VAR, "") or MODULE_SHA256
+    pins_path = _hook_path(environ, TEST_PINS_VAR, "")
+    if pins_path:
+        from_pins = _pins_module_sha256(pins_path)
+        if environ.get(TEST_SHA_VAR, "") not in ("", from_pins):
+            raise Fail(f"{TEST_SHA_VAR} and the module pin in {TEST_PINS_VAR} differ", code=2)
+        module_sha256 = from_pins
+    expect_uid = os.getuid() if test_root else 0
+    return Config(
+        test_root,
+        module_sha256,
+        expect_uid,
+        test_root + STATE_DIR,
+        test_root + DATA_DIR,
+        *source_owner(environ, bool(test_root)),
+        pins_path=pins_path,
+        archives_path=_hook_path(environ, TEST_ARCHIVES_VAR, ""),
+        libdir=_hook_path(environ, TEST_LIBDIR_VAR, checkout_libdir() if test_root else LIBDIR),
+        curl=_hook_path(environ, TEST_CURL_VAR, test_root + CURL),
+        systemctl=_hook_path(environ, TEST_SYSTEMCTL_VAR, test_root + SYSTEMCTL),
+        setpriv=_hook_path(environ, TEST_SETPRIV_VAR, test_root + SETPRIV),
+        prlimit=_hook_path(environ, TEST_PRLIMIT_VAR, test_root + PRLIMIT),
+        sysfs=_hook_path(environ, TEST_SYSFS_VAR, test_root + SYSFS),
+        transport_path=_hook_path(environ, TEST_TRANSPORT_VAR, ""),
+        setup_dir=test_root + SETUP_DIR,
+        log_path=test_root + LOG_PATH,
+        check_template=not (environ.get(TEST_SHA_VAR, "") and not pins_path),
+        proxies=proxies,
+    )
+
+
+# ------------------------------------------------------------- the shared package
+
+
+def tree_problem(pkgdir: str, owners: frozenset[int] | set[int], top: str = "/") -> str | None:
+    """Why the package directory `pkgdir` cannot be trusted, or None.
+
+    Every directory from `top` down to `pkgdir` and everything inside `pkgdir` must be a
+    real directory or regular file (no symlink, nothing else), owned by one of `owners`,
+    and not writable by group or others. lstat only: nothing is followed.
+
+    One exception, the usual one for a path above the trusted files: a directory above
+    `pkgdir` that is owned by root and has the sticky bit (/tmp, where makepkg builds
+    with BUILDDIR=/tmp/makepkg) may be writable by others, since nobody but root and the
+    owner of an entry in it can rename or remove that entry, and the entry itself is
+    checked next. Never `pkgdir` itself nor anything inside it.
+    """
+    rel = os.path.relpath(pkgdir, top)
+    if rel == ".." or rel.startswith("../"):
+        return f"{pkgdir} is not under {top}"
+    chain, here = [top], top
+    for part in [] if rel == "." else rel.split("/"):
+        here = os.path.join(here, part)
+        chain.append(here)
+
+    def problem(path: str, want_dir: bool | None, above: bool = False) -> str | None:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return f"{path} does not exist"
+        except OSError as exc:
+            return f"{path} cannot be checked: {exc.strerror}"
+        if stat.S_ISLNK(st.st_mode):
+            return f"{path} is a symlink"
+        if want_dir and not stat.S_ISDIR(st.st_mode):
+            return f"{path} is not a directory"
+        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+            return f"{path} is not a regular file or directory"
+        if st.st_uid not in owners:
+            return (
+                f"{path} is owned by {user_name(st.st_uid)}, not by {' or '.join(user_name(u) for u in sorted(owners))}"
+            )
+        if st.st_mode & 0o022 and not (above and st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
+            return f"{path} is writable by its group or by others (mode {stat.S_IMODE(st.st_mode):04o})"
+        return None
+
+    for d in chain:
+        if why := problem(d, True, above=d != chain[-1]):
+            return why
+    if why := problem(os.path.join(pkgdir, "__init__.py"), False):
+        return why
+    for root, dirs, files in os.walk(pkgdir):
+        for name in sorted(dirs) + sorted(files):
+            if why := problem(os.path.join(root, name), None):
+                return why
+    return None
+
+
+@dataclasses.dataclass
+class Package:
+    """The modules of the shared synaptics0078 package, loaded from a checked directory."""
+
+    pkgdir: str
+    pins: object
+    calibration: object
+    calib_model: object
+    template: object
+    vendor: object
+    session: object
+
+
+def load_package(cfg: Config) -> Package:
+    """Load synaptics0078 from cfg.libdir after tree_problem passed; by file location, not sys.path."""
+    pkgdir = os.path.join(os.path.realpath(cfg.libdir), PACKAGE)
+    owners = {0} if os.geteuid() == 0 else {0, os.geteuid()}
+    if why := tree_problem(pkgdir, owners):
+        raise Fail(
+            f"the {PACKAGE} package in {cfg.libdir} cannot be trusted: {why}; nothing was done",
+            hint="reinstall it: sudo pacman -S libfprint-sigfm-0078" if not cfg.test_root else "",
+            code=2,
+        )
+    init = os.path.join(pkgdir, "__init__.py")
+    have = sys.modules.get(PACKAGE)
+    if have is not None:
+        where = getattr(have, "__file__", None) or ""
+        if os.path.realpath(where) != os.path.realpath(init):
+            raise Fail(f"another {PACKAGE} package is already loaded ({where}); nothing was done", code=2)
+    else:
+        spec = importlib.util.spec_from_file_location(PACKAGE, init, submodule_search_locations=[pkgdir])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[PACKAGE] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            del sys.modules[PACKAGE]
+            raise
+    mods = {
+        n: importlib.import_module(f"{PACKAGE}.{n}")
+        for n in ("pins", "calibration", "calib_model", "template", "vendor", "session")
+    }
+    pk = Package(pkgdir=pkgdir, **mods)
+    p = pk.pins
+    if (p.MODULE_LEN, p.MODULE_SHA256, p.TEMPLATE_LEN) != (MODULE_SIZE, MODULE_SHA256, PROGRAM_SIZE):
+        raise Fail(f"the {PACKAGE} package in {cfg.libdir} does not belong to this tool (other pins)", code=2)
+    return pk
+
+
+def child_code(pkgdir: str) -> str:
+    """The -c program of the unprivileged extractor: load the checked package, run vendor.child_entry()."""
+    init = os.path.join(pkgdir, "__init__.py")
+    return (
+        "import importlib.util as u, sys; "
+        f"s = u.spec_from_file_location({PACKAGE!r}, {init!r}, submodule_search_locations=[{pkgdir!r}]); "
+        "m = u.module_from_spec(s); sys.modules[s.name] = m; s.loader.exec_module(m); "
+        f"from {PACKAGE} import vendor; sys.exit(vendor.child_entry())"
+    )
+
+
+# ------------------------------------------------------------------- data source
+# The data SOURCE is one function returning a DataSet; checking it and installing it
+# are separate steps that never look at where the bytes came from. Phase A reads a
+# directory prepared on Windows-derived inputs (load_from_dir). Phase B (cmd_setup)
+# feeds the same install path: the module from the public vendor download (hash-checked
+# against the same pin) and the program built from calibration read on the sensor.
+
+
+@dataclasses.dataclass
+class DataSet:
+    origin: str  # where the bytes came from, for messages
+    module: bytes | None = None
+    programs: dict[str, bytes] = dataclasses.field(default_factory=dict)  # serial as named -> bytes
+    unreadable: dict[str, str] = dataclasses.field(default_factory=dict)  # file name -> why it was not read
+    others: list[str] = dataclasses.field(default_factory=list)  # names that are not data files
+    stats: dict[str, os.stat_result] = dataclasses.field(default_factory=dict)  # file name -> fstat of what was read
+
+
+def program_name(serial: str) -> str:
+    return f"program-{serial}.bin"
+
+
+def not_owner_text(uid: int, owner_uid: int) -> str:
+    return f"is owned by {user_name(uid)}, not by {user_name(owner_uid)} who ran sudo"
+
+
+def open_checked(path: str, owner_uid: int | None = None, dir_fd: int | None = None) -> tuple[int, os.stat_result]:
+    """(an fd open for reading, its fstat) of the regular file `path` (no symlink).
+
+    The name is first opened with O_PATH | O_NOFOLLOW, which opens nothing of the file
+    itself (no device driver is started, no FIFO waited on, nothing is readable through
+    it): the type and the owner (when `owner_uid` is given) are checked on that fd. Only
+    a regular file is then opened for reading, through /proc/self/fd/N, which reaches the
+    inode already checked and not the name again (that reopen cannot carry O_NOFOLLOW:
+    /proc/self/fd/N is itself a link, the one to follow), and its fstat must show the
+    same device and inode.
+    """
+    try:
+        pfd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise BadFile("does not exist") from None
+    except OSError as exc:
+        raise BadFile(f"cannot be opened: {exc.strerror}") from None
+    try:
+        st = os.fstat(pfd)
+        if stat.S_ISLNK(st.st_mode):
+            raise BadFile("is a symlink; give the file itself")
+        if owner_uid is not None and st.st_uid != owner_uid:
+            raise BadFile(f"{not_owner_text(st.st_uid, owner_uid)}; not read")
+        if not stat.S_ISREG(st.st_mode):
+            raise BadFile("is not a regular file")
+        try:
+            fd = os.open(f"/proc/self/fd/{pfd}", _RDONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            raise BadFile(f"cannot be opened: {exc.strerror}") from None
+    finally:
+        os.close(pfd)
+    try:
+        again = os.fstat(fd)
+        if (again.st_dev, again.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(again.st_mode):
+            raise BadFile("changed while it was read; run the command again")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, again
+
+
+def read_regular_at(dir_fd: int, name: str, size: int, owner_uid: int | None = None) -> tuple[bytes, os.stat_result]:
+    """The bytes and fstat of `name` in dir_fd: a regular file (no symlink) of exactly `size` bytes.
+
+    The type, the owner (when `owner_uid` is given) and the size are checked before the
+    file is opened for reading (open_checked); the file is read once, and a file that
+    changes size meanwhile is refused.
+    """
+    fd, st = open_checked(name, owner_uid, dir_fd=dir_fd)
+    try:
+        if st.st_size != size:
+            raise BadFile(f"is {st.st_size} bytes, expected {size}")
+        chunks = []
+        left = size + 1  # one byte more: notice a file that grew
+        while left > 0:
+            chunk = os.read(fd, left)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(data) != size:
+        raise BadFile("changed while it was read; run the command again")
+    return data, st
+
+
+def read_capped(path: str, cap: int, owner_uid: int | None = None, dir_fd: int | None = None) -> bytes:
+    """The bytes of a regular file (no symlink) of at most `cap` bytes, read once.
+
+    Type, owner (when `owner_uid` is given) and size are checked before the file is
+    opened for reading (open_checked); a file that changes size meanwhile is refused.
+    """
+    fd, st = open_checked(path, owner_uid, dir_fd=dir_fd)
+    try:
+        if st.st_size > cap:
+            raise BadFile(f"is {st.st_size} bytes, more than the {cap >> 20} MB allowed")
+        chunks, got = [], 0
+        while got <= st.st_size:
+            chunk = os.read(fd, st.st_size + 1 - got)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(data) != st.st_size:
+        raise BadFile("changed while it was read; run the command again")
+    return data
+
+
+def open_dir_nofollow(path: str) -> int:
+    try:
+        return os.open(path, _DIR_FLAGS)
+    except FileNotFoundError:
+        raise Fail(f"no directory {path}", hint=SOURCE_HINT) from None
+    except OSError as exc:
+        # O_DIRECTORY | O_NOFOLLOW on a symlink fails with ENOTDIR on Linux, ELOOP elsewhere.
+        if exc.errno == errno.ELOOP or (exc.errno == errno.ENOTDIR and os.path.islink(path)):
+            raise Fail(f"{path} is a symlink; give the directory itself") from None
+        if exc.errno == errno.ENOTDIR:
+            raise Fail(f"{path} is not a directory") from None
+        raise Fail(f"cannot open {path}: {exc.strerror}") from None
+
+
+def load_from_dir(path: str, owner_uid: int | None = None) -> DataSet:
+    """Phase A source: module.bin and every program-*.bin in the directory `path`.
+
+    With `owner_uid` (the user who ran sudo) the directory must belong to that user,
+    checked before anything in it is listed, and a data file of another owner is
+    refused unread.
+    """
+    ds = DataSet(origin=path)
+    dir_fd = open_dir_nofollow(path)
+    try:
+        if owner_uid is not None and (uid := os.fstat(dir_fd).st_uid) != owner_uid:
+            raise Fail(
+                f"{path} {not_owner_text(uid, owner_uid)}; refusing to look inside it",
+                hint="give a directory of your own: " + SOURCE_HINT,
+            )
+        for name in sorted(os.listdir(dir_fd)):
+            match = PROGRAM_NAME_RE.fullmatch(name)
+            if name == MODULE_NAME:
+                size = MODULE_SIZE
+            elif match:
+                size = PROGRAM_SIZE
+            else:
+                ds.others.append(name)
+                continue
+            try:
+                data, ds.stats[name] = read_regular_at(dir_fd, name, size, owner_uid)
+            except BadFile as exc:
+                ds.unreadable[name] = str(exc)
+                continue
+            if match:
+                ds.programs[match.group(1)] = data
+            else:
+                ds.module = data
+    finally:
+        os.close(dir_fd)
+    return ds
+
+
+# -------------------------------------------------------------------- validation
+
+
+def module_problem(data: bytes, expected_sha256: str) -> str | None:
+    """Why `data` is not the module the driver accepts, or None."""
+    if len(data) != MODULE_SIZE:
+        return f"is {len(data)} bytes, expected {MODULE_SIZE}"
+    got = hashlib.sha256(data).hexdigest()
+    if got != expected_sha256:
+        return f"has sha256 {got}, expected {expected_sha256} (not the module this driver needs)"
+    return None
+
+
+def program_problem(serial: str, data: bytes) -> str | None:
+    """Why `data`, named program-<serial>.bin, is not a program the driver accepts, or None."""
+    if not SERIAL_RE.fullmatch(serial):
+        return "is not named program-<12 lowercase hex characters>.bin"
+    if len(data) != PROGRAM_SIZE:
+        return f"is {len(data)} bytes, expected {PROGRAM_SIZE}"
+    if data[0] != PROGRAM_OPCODE:
+        return f"starts with 0x{data[0]:02x}, expected 0x{PROGRAM_OPCODE:02x}"
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class Check:
+    name: str
+    problem: str | None  # None: valid
+    present: bool  # False: the file is missing
+
+
+def check_dataset(ds: DataSet, cfg: Config) -> list[Check]:
+    """One Check per data file, module.bin first; a missing module or program is one too."""
+    out = [Check(name, why, True) for name, why in ds.unreadable.items()]
+    if ds.module is not None:
+        out.append(Check(MODULE_NAME, module_problem(ds.module, cfg.module_sha256), True))
+    elif MODULE_NAME not in ds.unreadable:
+        out.append(Check(MODULE_NAME, f"is missing from {ds.origin}", False))
+    for serial, data in ds.programs.items():
+        out.append(Check(program_name(serial), program_problem(serial, data), True))
+    if not ds.programs and not any(PROGRAM_NAME_RE.fullmatch(n) for n in ds.unreadable):
+        out.append(Check("program-<serial>.bin", f"is missing from {ds.origin}: there is none", False))
+    return sorted(out, key=lambda c: (c.name != MODULE_NAME, c.name))
+
+
+def describe_ok(name: str) -> str:
+    """What was checked on the valid file `name`."""
+    if name == MODULE_NAME:
+        return f"{MODULE_SIZE} bytes, sha256 ok"
+    serial = PROGRAM_NAME_RE.fullmatch(name).group(1)
+    return f"serial {serial}, {PROGRAM_SIZE} bytes, starts with 0x{PROGRAM_OPCODE:02x}"
+
+
+# ----------------------------------------------------------------------- output
+
+
+def ok(text: str) -> None:
+    print(f"  ok    {text}")
+
+
+def failed(text: str) -> None:
+    print(f"  FAILED {text}")
+
+
+def note(text: str) -> None:
+    print(f"  note  {text}")
+
+
+def already(text: str) -> None:
+    print(f"  already {text}")
+
+
+def user_name(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def group_name(gid: int) -> str:
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
+def owner_text(cfg: Config) -> str:
+    return f"{user_name(cfg.expect_uid)} (test root)" if cfg.test_root else "root:root"
+
+
+# The step lines of install, recalibrate and fetch: one line per step, or a started line
+# ("Calibrating... ") that the step's outcome finishes ("done.").
+_pending = [False]
+
+
+def say(text: str = "") -> None:
+    if _pending[0]:
+        print(flush=True)
+        _pending[0] = False
+    print(text, flush=True)
+
+
+def begin(text: str) -> None:
+    if _pending[0]:
+        print(flush=True)
+    print(text, end="", flush=True)
+    _pending[0] = True
+
+
+def finish(text: str) -> None:
+    print(text, flush=True)
+    _pending[0] = False
+
+
+def end_pending_line() -> None:
+    if _pending[0]:
+        print(flush=True)
+        _pending[0] = False
+
+
+# Patched by the tests: the waits and the Enter prompt.
+sleep = time.sleep
+
+
+def stdin_is_tty() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def read_line() -> str:
+    return sys.stdin.readline()
+
+
+# ---------------------------------------------------------------------- install
+
+
+@dataclasses.dataclass
+class Plan:
+    make_state_dir: bool = False
+    make_data_dir: bool = False
+    fix_mode_from: int | None = None  # the data dir's wrong mode, to set to 0700
+    writes: list[tuple[str, bytes, str]] = dataclasses.field(default_factory=list)  # name, bytes, why
+    fix_files: list[tuple[str, str]] = dataclasses.field(default_factory=list)  # identical file, its wrong mode/owner
+    refusals: list[str] = dataclasses.field(default_factory=list)
+    needs_force: bool = False  # a refusal that --force would lift
+
+
+def lstat_or_none(path: str) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def dir_refusal(path: str, st: os.stat_result, cfg: Config) -> str | None:
+    if stat.S_ISLNK(st.st_mode):
+        return f"{path} is a symlink; refusing to write through it"
+    if not stat.S_ISDIR(st.st_mode):
+        return f"{path} exists and is not a directory"
+    if st.st_uid != cfg.expect_uid:
+        return f"{path} is owned by {user_name(st.st_uid)}, not {user_name(cfg.expect_uid)}; refusing to use it"
+    return None
+
+
+def file_attr_problem(st: os.stat_result, cfg: Config) -> str | None:
+    """The mode and owner of an installed data file if they are not 0600 root:root, else None.
+
+    Under a test root the owner expected is the test user, group not checked.
+    """
+    mode = stat.S_IMODE(st.st_mode)
+    if cfg.test_root:
+        owner_ok = st.st_uid == cfg.expect_uid
+    else:
+        owner_ok = st.st_uid == 0 and st.st_gid == 0
+    if mode == FILE_MODE and owner_ok:
+        return None
+    return f"owner {user_name(st.st_uid)}:{group_name(st.st_gid)}, mode {mode:04o}"
+
+
+def read_installed(path: str, size: int) -> tuple[os.stat_result, bytes | None]:
+    """(fstat, bytes if the size is `size`) of an installed regular file; BadFile otherwise."""
+    try:
+        fd = os.open(path, _RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise BadFile("is a symlink; refusing to replace or follow it") from None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise BadFile("exists and is not a regular file")
+        if st.st_size != size:
+            return st, None
+        data = b""
+        while len(data) <= size:
+            chunk = os.read(fd, size + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return st, data
+    finally:
+        os.close(fd)
+
+
+def plan_file(plan: Plan, cfg: Config, name: str, data: bytes, force: bool, dry_run: bool) -> None:
+    path = os.path.join(cfg.data_dir, name)
+    try:
+        st, current = read_installed(path, len(data))
+    except FileNotFoundError:
+        plan.writes.append((name, data, "new"))
+        return
+    except BadFile as exc:
+        plan.refusals.append(f"{path} {exc}")
+        return
+    except PermissionError:
+        if not dry_run:
+            raise
+        note(f"cannot read the installed {name} as {user_name(os.geteuid())} (root only): not checked")
+        return
+    if current == data:
+        already(f"installed: {name} (identical)")
+        if attrs := file_attr_problem(st, cfg):
+            plan.fix_files.append((name, attrs))
+        return
+    if name == MODULE_NAME:
+        # Only one module is valid, so an installed module that differs is invalid: replace it.
+        why = module_problem(current, cfg.module_sha256) if current is not None else f"is {st.st_size} bytes"
+        if why is not None:
+            plan.writes.append((name, data, f"the installed one was not valid: it {why}"))
+            return
+    if force:
+        plan.writes.append((name, data, "--force"))
+        return
+    plan.refusals.append(f"{name} is already installed with different contents (--force replaces it)")
+    plan.needs_force = True
+
+
+def make_plan(cfg: Config, ds: DataSet, force: bool, dry_run: bool) -> Plan:
+    plan = Plan()
+    st = lstat_or_none(cfg.state_dir)
+    if st is not None and (why := dir_refusal(cfg.state_dir, st, cfg)):
+        plan.refusals.append(why)
+        return plan
+    plan.make_state_dir = st is None
+    try:
+        st = None if plan.make_state_dir else lstat_or_none(cfg.data_dir)
+    except PermissionError:
+        if not dry_run:
+            raise
+        note(
+            f"cannot look inside {cfg.state_dir} as {user_name(os.geteuid())} (root only): this plan assumes it is empty"
+        )
+        st = None
+        plan.make_state_dir = False
+    if st is not None:
+        if why := dir_refusal(cfg.data_dir, st, cfg):
+            plan.refusals.append(why)
+            return plan
+        if stat.S_IMODE(st.st_mode) != DIR_MODE:
+            plan.fix_mode_from = stat.S_IMODE(st.st_mode)
+    else:
+        plan.make_data_dir = True
+    targets = [(MODULE_NAME, ds.module)] + [(program_name(s), d) for s, d in sorted(ds.programs.items())]
+    for name, data in targets:
+        if plan.make_data_dir:
+            plan.writes.append((name, data, "new"))
+        else:
+            plan_file(plan, cfg, name, data, force, dry_run)
+    return plan
+
+
+def open_or_make_dir(parent_fd: int, name: str, path: str, make: bool, cfg: Config) -> tuple[int, bool]:
+    """(an fd of the directory `name` in parent_fd, whether this call created it).
+
+    Created 0700 if `make`; one that appeared since the plan (EEXIST, e.g. fprintd
+    making /var/lib/fprint) is opened like an existing one. Either way it is opened
+    without following a symlink and checked again on the open fd.
+    """
+    created = False
+    if make:
+        try:
+            os.mkdir(name, DIR_MODE, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+    try:
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        # O_DIRECTORY | O_NOFOLLOW on a symlink fails with ENOTDIR on Linux, ELOOP elsewhere.
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if why := dir_refusal(path, st, cfg):
+                raise Fail(why) from None
+        raise
+    try:
+        if created:
+            if not cfg.test_root:
+                os.fchown(fd, 0, 0)
+            os.fchmod(fd, DIR_MODE)
+            os.fsync(parent_fd)
+        st = os.fstat(fd)
+        if why := dir_refusal(path, st, cfg):
+            raise Fail(why)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, created
+
+
+def fix_file_attrs(dir_fd: int, name: str, cfg: Config) -> None:
+    """Set an installed file to 0600 root:root (test root: mode only) through an O_NOFOLLOW fd."""
+    fd = os.open(name, _RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Fail(f"{os.path.join(cfg.data_dir, name)} is no longer a regular file; run the command again")
+        if not cfg.test_root:
+            os.fchown(fd, 0, 0)
+        os.fchmod(fd, FILE_MODE)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(dir_fd: int, name: str, data: bytes, cfg: Config) -> None:
+    """Replace `name` in dir_fd by `data`, 0600 root:root: temp file, fsync, rename."""
+    tmp = f".{name}.{secrets.token_hex(6)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, FILE_MODE, dir_fd=dir_fd)
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            if not cfg.test_root:
+                os.fchown(fd, 0, 0)
+            os.fchmod(fd, FILE_MODE)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp, dir_fd=dir_fd)
+        raise
+
+
+def carry_out(plan: Plan, cfg: Config) -> None:
+    parent = os.path.dirname(cfg.state_dir)
+    parent_fd = os.open(parent, _RDONLY | os.O_DIRECTORY)
+    try:
+        state_fd, created = open_or_make_dir(
+            parent_fd, os.path.basename(cfg.state_dir), cfg.state_dir, plan.make_state_dir, cfg
+        )
+    finally:
+        os.close(parent_fd)
+    if created:
+        ok(f"created {cfg.state_dir} (mode 0700, {owner_text(cfg)})")
+    try:
+        data_fd, created = open_or_make_dir(
+            state_fd, os.path.basename(cfg.data_dir), cfg.data_dir, plan.make_data_dir, cfg
+        )
+    finally:
+        os.close(state_fd)
+    try:
+        if created:
+            ok(f"created {cfg.data_dir} (mode 0700, {owner_text(cfg)})")
+        elif (was := stat.S_IMODE(os.fstat(data_fd).st_mode)) != DIR_MODE:
+            os.fchmod(data_fd, DIR_MODE)
+            ok(f"set {cfg.data_dir} to mode 0700 (it was {was:04o})")
+        for name, attrs in plan.fix_files:
+            fix_file_attrs(data_fd, name, cfg)
+            ok(f"set {name} to mode 0600, {owner_text(cfg)} (it was {attrs})")
+        for name, data, why in plan.writes:
+            write_atomic(data_fd, name, data, cfg)
+            if why == "new":
+                ok(f"installed {name} (mode 0600, {owner_text(cfg)})")
+            else:
+                ok(f"replaced {name} ({why})")
+        os.fsync(data_fd)
+    finally:
+        os.close(data_fd)
+
+
+def show_plan(plan: Plan, cfg: Config) -> None:
+    if plan.make_state_dir:
+        print(f"  would create {cfg.state_dir} (mode 0700, {owner_text(cfg)})")
+    if plan.make_data_dir:
+        print(f"  would create {cfg.data_dir} (mode 0700, {owner_text(cfg)})")
+    if plan.fix_mode_from is not None:
+        print(f"  would set {cfg.data_dir} to mode 0700 (it is {plan.fix_mode_from:04o})")
+    for name, attrs in plan.fix_files:
+        print(f"  would set {name} to mode 0600, {owner_text(cfg)} (it is {attrs})")
+    for name, _, why in plan.writes:
+        if why == "new":
+            print(f"  would install {name} (mode 0600, {owner_text(cfg)})")
+        else:
+            print(f"  would replace {name} ({why})")
+
+
+def sudo_line(source: str, force: bool) -> str:
+    line = f"sudo {PROG} install --from {shlex.quote(source)}"
+    return line + " --force" if force else line
+
+
+def cmd_install(cfg: Config, source: str, force: bool, dry_run: bool) -> int:
+    """Phase A: install --from DIR."""
+    source = os.path.abspath(source)
+    if not cfg.test_root and os.geteuid() != 0 and not dry_run:
+        raise Fail(
+            "install needs root; nothing was changed. Run:\n  " + sudo_line(source, force),
+            code=2,
+        )
+    print(f"{PROG} install: data from {source}" + (f" (TEST ROOT {cfg.test_root})" if cfg.test_root else ""))
+    if dry_run:
+        print("dry run: nothing is changed")
+
+    print(f"checking the files in {source}:")
+    if cfg.source_unchecked:
+        note(f"not run through sudo ({SUDO_UID_VAR} is not set): the owner of {source} was not checked")
+    ds = load_from_dir(source, cfg.source_uid)
+    results = check_dataset(ds, cfg)
+    for check in results:
+        if check.problem is None:
+            ok(f"{check.name} ({describe_ok(check.name)})")
+        else:
+            failed(f"{check.name} {check.problem}")
+    for name in ds.others:
+        note(f"ignored: {name} (not a data file)")
+    if any(check.problem is not None for check in results):
+        raise Fail("nothing was installed: fix the files marked FAILED above", hint=SOURCE_HINT)
+
+    print(f"installing into {cfg.data_dir}:")
+    plan = make_plan(cfg, ds, force, dry_run)
+    if plan.refusals:
+        for why in plan.refusals:
+            failed(why)
+        hint = f"to replace them, run: {sudo_line(source, True)}" if plan.needs_force else ""
+        raise Fail("nothing was installed", hint=hint)
+    if dry_run:
+        show_plan(plan, cfg)
+        print("dry run: nothing was changed; run the same command without --dry-run to install")
+        return 0
+    carry_out(plan, cfg)
+    print(DONE_LINE)
+    return 0
+
+
+# --------------------------------------------------------------- the log, sysfs
+
+
+class Redactor:
+    """Replaces every known form of the unit serial (any case) by <serial>."""
+
+    def __init__(self):
+        self.words: set[str] = set()
+        self.pattern: re.Pattern | None = None
+
+    def add_serial(self, serial_text: str) -> None:
+        """Add a 12-hex serial, in the sysfs form and in RomInfo's raw (nibble-swapped back) form."""
+        if not serial_text:
+            return
+        self.words.add(serial_text.lower())
+        if SERIAL_RE.fullmatch(serial_text.lower()):
+            self.words.add(serial_hex(bytes.fromhex(serial_text.lower())))
+        self.pattern = re.compile(
+            "|".join(re.escape(w) for w in sorted(self.words, key=len, reverse=True)), re.IGNORECASE
+        )
+
+    def __call__(self, text: str) -> str:
+        return self.pattern.sub(REDACTED, text) if self.pattern else text
+
+
+class NullLog:
+    path = ""
+
+    def write(self, kind: str, text: str) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class SetupLog:
+    """Append-only text log, 0600 root (the test user under a test root), every line redacted."""
+
+    def __init__(self, cfg: Config, redact: Redactor):
+        self.path, self.redact = cfg.log_path, redact
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY | os.O_NONBLOCK
+        try:
+            fd = os.open(self.path, flags, FILE_MODE)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise Fail(f"the log {self.path} is a symlink; refusing to write through it") from None
+            raise Fail(f"cannot open the log {self.path}: {exc.strerror}") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise Fail(f"the log {self.path} is not a plain file (or has other hard links); remove it")
+            if cfg.test_root:
+                if st.st_uid != cfg.expect_uid:
+                    raise Fail(f"the log {self.path} is owned by {user_name(st.st_uid)}; remove it")
+            else:
+                os.fchown(fd, 0, 0)
+            os.fchmod(fd, FILE_MODE)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+
+    def write(self, kind: str, text: str) -> None:
+        if self.fd is None:
+            return
+        stamp = datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
+        lines = self.redact(str(text)).replace("\r", " ").split("\n")
+        data = "".join(f"{stamp} {kind:<6} {line}\n" for line in lines)
+        with contextlib.suppress(OSError):
+            os.write(self.fd, data.encode("utf-8", "replace"))
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+class LogLines:
+    """A text stream (for redirect_stdout) that sends every line to the log."""
+
+    def __init__(self, log, kind: str = "FILES"):
+        self.log, self.kind, self.buf = log, kind, ""
+
+    def write(self, text: str) -> int:
+        self.buf += text
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            self.log.write(self.kind, line)
+        return len(text)
+
+    def flush(self) -> None:
+        if self.buf:
+            self.log.write(self.kind, self.buf)
+            self.buf = ""
+
+
+def serial_hex(raw: bytes) -> str:
+    """The driver's rule: each of the 6 RomInfo serial bytes nibble-swapped, as lowercase hex."""
+    return "".join(f"{((b & 0x0F) << 4) | (b >> 4):02x}" for b in raw)
+
+
+@dataclasses.dataclass(frozen=True)
+class Reader:
+    name: str  # the sysfs device name, e.g. 1-3
+    serial: str  # the USB serial, lowercased ("" if unreadable)
+
+
+def _read_attr(directory: str, name: str) -> str | None:
+    try:
+        with open(os.path.join(directory, name), "rb") as fh:
+            raw = fh.read(256)
+    except OSError:
+        return None
+    return raw.decode("ascii", "replace").strip()
+
+
+def find_readers(cfg: Config) -> list[Reader]:
+    """Every 06cb:0078 USB device in sysfs (idVendor, idProduct, serial); no USB I/O."""
+    base = os.path.join(cfg.sysfs, "bus", "usb", "devices")
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if ":" in name:  # an interface, not a device
+            continue
+        d = os.path.join(base, name)
+        if (_read_attr(d, "idVendor"), _read_attr(d, "idProduct")) == READER_IDS:
+            out.append(Reader(name, (_read_attr(d, "serial") or "").lower()))
+    return out
+
+
+# ------------------------------------------------------------------- one run
+
+
+def now_iso() -> str:
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _safe(text: str, limit: int = 120) -> str:
+    out = "".join(c if 32 <= ord(c) < 127 else "?" for c in str(text))
+    return out if len(out) <= limit else out[: limit - 3] + "..."
+
+
+class Run:
+    """One install, recalibrate, fetch or status run: the config, the package, the pins, the log."""
+
+    def __init__(self, cfg: Config, pk: Package, command: str, *, dry_run: bool = False, yes: bool = False):
+        self.cfg, self.pk, self.command = cfg, pk, command
+        self.dry_run, self.yes = dry_run, yes
+        self.redact = Redactor()
+        self.log = NullLog()
+        self.pins = self._load_pins()
+        self.archives = self._load_archives()
+        self.known = frozenset(a.sha256 for a in self.archives)
+        self.vendor_dir = os.path.join(cfg.setup_dir, VENDOR_NAME)
+        self.backup_dir = os.path.join(cfg.setup_dir, BACKUP_NAME)
+        self._fake = None
+
+    # -- inputs ---------------------------------------------------------------
+
+    def _load_pins(self):
+        if not self.cfg.pins_path:
+            return self.pk.pins.DEFAULT_PINS
+        try:
+            with open(self.cfg.pins_path, encoding="utf-8") as fh:
+                pins = self.pk.pins.Pins.from_json(fh.read(MAX_SMALL_FILE))
+        except (OSError, ValueError) as exc:
+            raise Fail(f"{TEST_PINS_VAR}: {exc}", code=2) from None
+        if pins.module_sha256 != self.cfg.module_sha256:
+            raise Fail(f"{TEST_PINS_VAR}: the module pin changed while the tool ran", code=2)
+        return pins
+
+    def _load_archives(self):
+        if not self.cfg.archives_path:
+            return tuple(self.pk.pins.ARCHIVES)
+        Archive = self.pk.pins.Archive
+        try:
+            with open(self.cfg.archives_path, encoding="utf-8") as fh:
+                doc = json.loads(fh.read(MAX_SMALL_FILE))
+            out = tuple(Archive(**d) for d in doc)
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
+            raise Fail(f"{TEST_ARCHIVES_VAR}: not a list of archives ({exc})", code=2) from None
+        for a in out:
+            if not (SHA256_RE.fullmatch(a.sha256) and CACHE_NAME_RE.fullmatch(f"{a.sha256}-{a.name}")):
+                raise Fail(f"{TEST_ARCHIVES_VAR}: bad archive entry {a.name!r}", code=2)
+        return out
+
+    # -- output ---------------------------------------------------------------
+
+    def say(self, text: str) -> None:
+        self.log.write("SAY", text)
+        say(self.redact(text))
+
+    def begin(self, text: str) -> None:
+        self.log.write("SAY", text)
+        begin(self.redact(text))
+
+    def finish(self, text: str) -> None:
+        self.log.write("SAY", text)
+        finish(self.redact(text))
+
+    def next_command(self) -> str:
+        return f"sudo {PROG} {self.command}"
+
+    @contextlib.contextmanager
+    def logged(self):
+        """The log open for the run (not in a dry run); a failure is logged before it is shown."""
+        if not self.dry_run:
+            self.log = SetupLog(self.cfg, self.redact)
+            self.log.write("INFO", f"{PROG} {TOOL_VERSION} {self.command} started (pid {os.getpid()})")
+            self.log.write("INFO", f"package {self.pk.pkgdir}, pins: template {self.pins.template_sha256}")
+        try:
+            yield
+        except Fail as exc:
+            self.log.write("FAILED", f"{exc} | {exc.hint}" if exc.hint else str(exc))
+            raise Fail(self.redact(str(exc)), self.redact(exc.hint), exc.code) from None
+        except KeyboardInterrupt:
+            self.log.write("WARN", "interrupted")
+            raise
+        except OSError as exc:
+            self.log.write("ERROR", f"{exc!r}\n{traceback.format_exc()}")
+            raise Fail(
+                f"{self.redact(str(exc))} (details in the log: {self.cfg.log_path})", hint=self.next_command()
+            ) from None
+        except Exception as exc:  # noqa: BLE001 (a bug: the traceback goes to the log only)
+            self.log.write("ERROR", f"unexpected: {exc!r}\n{traceback.format_exc()}")
+            raise Fail(
+                f"Stopped by an unexpected error in this program (details in the log: {self.cfg.log_path}).",
+                code=1,
+            ) from None
+        finally:
+            self.log.write("INFO", "finished")
+            self.log.close()
+            self.log = NullLog()
+
+    # -- small files in this tool's own directories ----------------------------
+
+    def open_setup_dir(self, sub: str | None = None, make: bool = True) -> int | None:
+        """An fd of /var/lib/synaptics0078 (or its `sub`), made 0700 if `make`; None if absent."""
+        cfg = self.cfg
+        parent = os.path.dirname(cfg.setup_dir)
+        pfd = os.open(parent, _RDONLY | os.O_DIRECTORY)
+        try:
+            try:
+                fd, created = open_or_make_dir(pfd, os.path.basename(cfg.setup_dir), cfg.setup_dir, make, cfg)
+            except FileNotFoundError:
+                return None
+        finally:
+            os.close(pfd)
+        if not created and make and stat.S_IMODE(os.fstat(fd).st_mode) != DIR_MODE:
+            os.fchmod(fd, DIR_MODE)
+        if sub is None:
+            return fd
+        try:
+            try:
+                sfd, created = open_or_make_dir(fd, sub, os.path.join(cfg.setup_dir, sub), make, cfg)
+            except FileNotFoundError:
+                return None
+        finally:
+            os.close(fd)
+        if not created and make and stat.S_IMODE(os.fstat(sfd).st_mode) != DIR_MODE:
+            os.fchmod(sfd, DIR_MODE)
+        return sfd
+
+    def read_json_at(self, dir_fd: int, name: str) -> dict:
+        try:
+            doc = json.loads(read_capped(name, MAX_SMALL_FILE, dir_fd=dir_fd).decode("utf-8"))
+        except (BadFile, ValueError, UnicodeDecodeError, RecursionError):  # nested too deep: corrupt too
+            return {}
+        return doc if isinstance(doc, dict) else {}
+
+    def calibration_record(self) -> dict:
+        fd = self.open_setup_dir(make=False) if os.path.isdir(self.cfg.setup_dir) else None
+        if fd is None:
+            return {}
+        try:
+            return self.read_json_at(fd, CALIBRATION_NAME)
+        finally:
+            os.close(fd)
+
+    def write_calibration_record(self, record: dict) -> None:
+        fd = self.open_setup_dir()
+        try:
+            write_atomic(fd, CALIBRATION_NAME, (json.dumps(record, indent=2, sort_keys=True) + "\n").encode(), self.cfg)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+# ------------------------------------------------------------ vendor files
+
+
+@dataclasses.dataclass
+class Gathered:
+    """The pinned module and template collected so far, and where they came from."""
+
+    module: bytes | None = None
+    template: bytes | None = None
+    label: str = ""
+
+    def satisfied(self, need_module: bool, need_template: bool) -> bool:
+        return (self.module is not None or not need_module) and (self.template is not None or not need_template)
+
+    def take(self, run: Run, ex) -> bool:
+        """Keep what `ex` gave (pins checked again here); True when it added something."""
+        v, added = run.pk.vendor, False
+        if self.module is None and ex.module is not None and v.is_module(ex.module, run.pins):
+            self.module, added = bytes(ex.module), True
+        if self.template is None and ex.template is not None and v.is_template(ex.template, run.pins):
+            self.template, added = bytes(ex.template), True
+        return added
+
+
+def curl_argv(curl: str, archive, output: str) -> list[str]:
+    """The exact curl call (design decision 5): -q first, https only, capped in size and time."""
+    return [
+        curl,
+        "-q",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--tlsv1.2",
+        "--fail",
+        "--location",
+        "--max-redirs",
+        "3",
+        "--connect-timeout",
+        "20",
+        "--max-time",
+        str(archive.max_time),
+        "--max-filesize",
+        str(archive.max_bytes),
+        "--retry",
+        str(CURL_RETRIES),
+        "--retry-delay",
+        str(CURL_RETRY_DELAY_S),
+        "--silent",
+        "--show-error",
+        "--remove-on-error",
+        "--output",
+        output,
+        archive.url,
+    ]
+
+
+def curl_timeout_s(archive) -> int:
+    """The wall-clock cap of one curl run: every try at its --max-time, the delays between, a margin.
+
+    A backstop only: curl stops each try itself. A server's Retry-After can make curl wait
+    longer than --retry-delay; this cap then ends the run (a failed source).
+    """
+    return (CURL_RETRIES + 1) * archive.max_time + CURL_RETRIES * CURL_RETRY_DELAY_S + CURL_MARGIN_S
+
+
+def setpriv_argv(run: Run) -> list[str]:
+    """The unprivileged extractor (design decision 4): nobody, no groups, no new privileges, capped.
+
+    prlimit runs after setpriv, as nobody already (lowering a limit needs no privilege),
+    and the limits hold across its exec of python and the bsdtar children (CHILD_RLIMITS).
+    `--` ends prlimit's options: python's own are not read as prlimit's. The session of
+    its own (no controlling terminal: /dev/tty cannot be opened) comes from
+    vendor.run_capped, which kills the child's whole process group on every way out. The
+    child keeps its bsdtar runs in that group (vendor.child_main), so they die with it; a
+    process that starts a session of its own escapes it (NPROC and CPU caps still hold).
+    """
+    argv = [
+        run.cfg.setpriv,
+        f"--reuid={NOBODY}",
+        f"--regid={NOBODY}",
+        "--clear-groups",
+        "--no-new-privs",
+        run.cfg.prlimit,
+        *(f"--{name}={value}" for name, value in CHILD_RLIMITS),
+        "--",
+        PYTHON,
+        "-IB",
+        "-c",
+        child_code(run.pk.pkgdir),
+    ]
+    if run.cfg.pins_path:
+        argv += ["--pins", run.cfg.pins_path]
+    return argv
+
+
+def extract_in_child(run: Run, data: bytes):
+    """vendor.extract run as nobody; the framed output re-checked against every pin here."""
+    v = run.pk.vendor
+    argv = setpriv_argv(run)
+    run.log.write("INFO", f"unprivileged extractor: {argv[0]} ... {PYTHON} -IB -c <vendor.child_entry>")
+    try:
+        rc, out, err = v.run_capped(argv, data, v.MAX_CHILD_OUTPUT, CHILD_TIMEOUT_S)
+    except OSError as exc:
+        raise v.VendorError(f"cannot run {argv[0]}: {exc.strerror or exc}") from None
+    if err.strip():
+        run.log.write("CHILD", _safe(err.strip(), 2000))
+    run.log.write("INFO", f"extractor exit {rc}, {len(out)} bytes of output")
+    return v.parse_child_output(out, pins=run.pins)
+
+
+def extract_bytes(run: Run, data: bytes, name: str, known: bool):
+    """What `data` gives: the bare module or template here, a known archive in this process,
+    anything else in the unprivileged child. None when it cannot be read at all."""
+    v = run.pk.vendor
+    if v.is_module(data, run.pins):
+        return v.Extracted(module=bytes(data), provenance=[f"{name}: the bare module"])
+    if v.is_template(data, run.pins):
+        return v.Extracted(template=bytes(data), provenance=[f"{name}: the bare template"])
+    try:
+        if known:
+            run.log.write("INFO", f"{name}: a known archive (sha256 pinned): parsed in this process")
+            ex = v.extract(data, name=name, pins=run.pins)
+        else:
+            run.log.write("INFO", f"{name}: not a known archive: parsed by the unprivileged extractor")
+            ex = extract_in_child(run, data)
+    except v.VendorError as exc:
+        run.log.write("WARN", f"{name}: {exc}")
+        return None
+    for line in ex.provenance:
+        run.log.write("VENDOR", line)
+    return ex
+
+
+def gave_text(ex) -> list[str]:
+    return [w for w, b in (("module", ex.module), ("template", ex.template)) if b is not None]
+
+
+def update_manifest(run: Run, vfd: int, name: str, entry: dict) -> None:
+    manifest = run.read_json_at(vfd, MANIFEST_NAME)
+    manifest[name] = entry
+    write_atomic(vfd, MANIFEST_NAME, (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(), run.cfg)
+
+
+def cache_store(run: Run, vfd: int, data: bytes, suffix: str, entry: dict) -> str:
+    sha = hashlib.sha256(data).hexdigest()
+    name = f"{sha}-{suffix}"
+    write_atomic(vfd, name, data, run.cfg)
+    update_manifest(run, vfd, name, {**entry, "date": now_iso(), "size": len(data), "sha256": sha})
+    os.fsync(vfd)
+    run.log.write("INFO", f"cached as {run.vendor_dir}/{name}")
+    return name
+
+
+def cache_names(run: Run, vfd: int) -> list[str]:
+    order = {f"{a.sha256}-{a.name}": i for i, a in enumerate(run.archives)}
+    names = [n for n in os.listdir(vfd) if CACHE_NAME_RE.fullmatch(n)]
+    return sorted(names, key=lambda n: (order.get(n, len(order)), n))
+
+
+def entry_label(run: Run, name: str, manifest: dict) -> str:
+    entry = manifest.get(name)
+    if isinstance(entry, dict) and isinstance(entry.get("label"), str):
+        return _safe(entry["label"], 60)
+    sha = name[:64]
+    for a in run.archives:
+        if a.sha256 == sha:
+            return a.label
+    return "a file given earlier"
+
+
+def gather_from_cache(run: Run, g: Gathered, need_module: bool, need_template: bool, tried: set) -> bool:
+    """Use the cached vendor files; a corrupt entry (content not its sha256, too large) is removed."""
+    vfd = run.open_setup_dir(VENDOR_NAME, make=False) if os.path.isdir(run.cfg.setup_dir) else None
+    if vfd is None:
+        run.log.write("INFO", "vendor cache: none yet")
+        return False
+    try:
+        manifest = run.read_json_at(vfd, MANIFEST_NAME)
+        for name in cache_names(run, vfd):
+            sha = name[:64]
+            try:
+                data = read_capped(name, run.pk.vendor.MAX_INPUT, dir_fd=vfd)
+            except BadFile as exc:
+                run.log.write("WARN", f"vendor cache {name}: {exc}; removed")
+                with contextlib.suppress(OSError):
+                    os.unlink(name, dir_fd=vfd)
+                continue
+            if hashlib.sha256(data).hexdigest() != sha:
+                run.log.write("WARN", f"vendor cache {name}: its content does not have the sha256 of its name; removed")
+                with contextlib.suppress(OSError):
+                    os.unlink(name, dir_fd=vfd)
+                continue
+            tried.add(sha)
+            label = entry_label(run, name, manifest)
+            ex = extract_bytes(run, data, f"cache {name[64:].lstrip('-')}", sha in run.known)
+            if ex is None or not g.take(run, ex):
+                run.log.write("INFO", f"vendor cache {name}: gave nothing needed")
+                continue
+            g.label = g.label or label
+            if g.satisfied(need_module, need_template):
+                run.say(f"Using the vendor files saved earlier ({label})... done, checked.")
+                return True
+    finally:
+        os.close(vfd)
+    return False
+
+
+def download(run: Run, archive, vfd: int) -> bytes | None:
+    """One archive by curl into a private temp file in the cache dir, read once with its cap; None on failure."""
+    tmp = f".download-{secrets.token_hex(8)}.tmp"
+    argv = curl_argv(run.cfg.curl, archive, os.path.join(run.vendor_dir, tmp))
+    run.log.write("INFO", f"curl {archive.url} (cap {archive.max_bytes} bytes, {archive.max_time} s)")
+    env = {**_ENV_MIN, **dict(run.cfg.proxies)}
+    try:
+        try:
+            r = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=curl_timeout_s(archive),
+                env=env,
+                cwd="/",
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            run.log.write("WARN", f"curl could not run: {exc}")
+            return None
+        if r.returncode != 0:
+            text = r.stderr.decode("utf-8", "replace").strip()
+            run.log.write("WARN", f"curl exit {r.returncode}: {_safe(text, 500)}")
+            return None
+        try:
+            data = read_capped(tmp, archive.max_bytes, dir_fd=vfd)
+        except BadFile as exc:
+            run.log.write("WARN", f"download {exc}")
+            return None
+        run.log.write("INFO", f"downloaded {len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()}")
+        return data
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp, dir_fd=vfd)
+
+
+def gather_from_network(run: Run, g: Gathered, need_module: bool, need_template: bool, tried: set) -> None:
+    """The sources in order, stopping at the first that completes what is needed; cached. Fail otherwise."""
+    vfd = run.open_setup_dir(VENDOR_NAME)
+    try:
+        todo = [a for a in run.archives if a.sha256 not in tried]
+        for i, a in enumerate(todo):
+            run.begin(f"Getting the vendor files ({a.label})... ")
+            data = download(run, a, vfd)
+            ex = None
+            if data is not None:
+                sha = hashlib.sha256(data).hexdigest()
+                if sha != a.sha256:
+                    run.log.write("WARN", f"{a.name}: sha256 {sha} is not the pinned {a.sha256}; parsed unprivileged")
+                ex = extract_bytes(run, data, a.name, sha in run.known)
+            if ex is not None and g.take(run, ex):
+                cache_store(run, vfd, data, a.name, {"url": a.url, "label": a.label, "gave": gave_text(ex)})
+                g.label = g.label or a.label
+                if g.satisfied(need_module, need_template):
+                    run.finish("done, checked.")
+                    return
+            run.finish("not available." if i + 1 == len(todo) else "not available, trying the next source.")
+    finally:
+        os.close(vfd)
+    if run.cfg.proxies:
+        raise Fail(MSG_NO_DOWNLOAD, hint=f"details in the log: {run.cfg.log_path}")
+    raise Fail(
+        MSG_NO_DOWNLOAD,
+        hint=f"behind a proxy (sudo drops https_proxy), run: sudo --preserve-env=https_proxy {PROG} {run.command}",
+    )
+
+
+def gather_from_files(run: Run, files: list[str], g: Gathered, need_module: bool, need_template: bool) -> None:
+    """--from-file: each file read once (owner checked through sudo); what it gives is cached."""
+    cfg, v = run.cfg, run.pk.vendor
+    if cfg.source_unchecked:
+        run.log.write(
+            "NOTE", f"not run through sudo ({SUDO_UID_VAR} is not set): the owner of the files is not checked"
+        )
+    vfd = None
+    try:
+        for given in files:
+            path = os.path.abspath(given)
+            run.begin(f"Reading the vendor files ({path})... ")
+            try:
+                data = read_capped(path, v.MAX_INPUT, cfg.source_uid)
+            except BadFile as exc:
+                run.finish("refused.")
+                raise Fail(
+                    f"{path} {exc}", hint=f"give a file of your own: sudo {PROG} {run.command} --from-file FILE"
+                ) from None
+            sha = hashlib.sha256(data).hexdigest()
+            ex = extract_bytes(run, data, os.path.basename(path), sha in run.known)
+            if ex is None or not g.take(run, ex):
+                run.finish("nothing usable in it.")
+                continue
+            if vfd is None:
+                vfd = run.open_setup_dir(VENDOR_NAME)
+            kind = v.detect(data, run.pins) or "file"
+            suffix = next((a.name for a in run.archives if a.sha256 == sha), f"file-{kind}")
+            label = next(
+                (a.label for a in run.archives if a.sha256 == sha), f"--from-file {_safe(os.path.basename(path), 60)}"
+            )
+            cache_store(run, vfd, data, suffix, {"url": "--from-file", "label": label, "gave": gave_text(ex)})
+            g.label = g.label or label
+            run.finish("done, checked.")
+    finally:
+        if vfd is not None:
+            os.close(vfd)
+    if g.satisfied(need_module, need_template):
+        return
+    if need_template and g.template is None and g.module is not None:
+        raise Fail(MSG_BARE_MODULE, hint=f"sudo {PROG} {run.command} --from-file MODULE --from-file DLL_OR_ARCHIVE")
+    raise Fail(
+        "The files given do not contain the vendor files this reader needs (the module and the DLL tables), "
+        "so nothing was written.",
+        hint=f"use one of the archives {PROG} status lists: sudo {PROG} {run.command} --from-file FILE",
+    )
+
+
+def acquire(run: Run, files: list[str], module: bytes | None, need_module: bool, need_template: bool) -> Gathered:
+    g = Gathered(module=module)
+    if files:
+        gather_from_files(run, files, g, need_module, need_template)
+        return g
+    tried: set = set()
+    if gather_from_cache(run, g, need_module, need_template, tried):
+        return g
+    gather_from_network(run, g, need_module, need_template, tried)
+    return g
+
+
+# ------------------------------------------------------------ the installed state
+
+
+@dataclasses.dataclass
+class Installed:
+    module: bytes | None = None  # the installed module.bin, when valid
+    program: bytes | None = None  # the installed program for this reader, if it has the right size
+    program_present: bool = False
+    program_ok: bool = False
+    program_why: str | None = None
+    unreadable: bool = False  # not root: /var/lib/fprint could not be looked into
+
+
+def program_check(run: Run, serial: str, data: bytes) -> str | None:
+    """Why `data` is not a valid program for program-<serial>.bin, or None (the template pin, decision 10)."""
+    if why := program_problem(serial, data):
+        return why
+    if run.cfg.check_template:
+        good, why = run.pk.template.program_matches_template(data, pins=run.pins)
+        if not good:
+            return f"does not match the template: {why}"
+    return None
+
+
+def inspect_installed(run: Run, serial: str) -> Installed:
+    cfg, out = run.cfg, Installed()
+    try:
+        st = lstat_or_none(cfg.data_dir)
+    except PermissionError:
+        out.unreadable = True
+        return out
+    if st is None or not stat.S_ISDIR(st.st_mode):
+        return out
+    for name, size in ((MODULE_NAME, MODULE_SIZE), (program_name(serial), PROGRAM_SIZE)):
+        try:
+            _, data = read_installed(os.path.join(cfg.data_dir, name), size)
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            out.unreadable = True
+            continue
+        except (BadFile, OSError) as exc:
+            run.log.write("WARN", f"installed {name}: {exc}")
+            if name != MODULE_NAME:
+                out.program_present, out.program_why = True, str(exc)
+            continue
+        if name == MODULE_NAME:
+            if data is not None and module_problem(data, cfg.module_sha256) is None:
+                out.module = data
+            else:
+                run.log.write("INFO", "installed module.bin is not valid")
+            continue
+        out.program_present, out.program = True, data
+        if data is None:
+            out.program_why = "has the wrong size"
+        else:
+            out.program_why = program_check(run, serial, data)
+        out.program_ok = out.program_why is None
+        run.log.write("INFO", f"installed {name}: " + ("valid" if out.program_ok else f"not valid: {out.program_why}"))
+    return out
+
+
+def resplice_pin(run: Run, program: bytes) -> str | None:
+    """The earlier template pin the installed program's fixed part matches, or None (decision 11)."""
+    try:
+        zeroed = run.pk.template.zero_unit_regions(program)
+    except run.pk.calibration.CalibrationError:
+        return None
+    old = set(PREVIOUS_TEMPLATE_SHA256)
+    recorded = run.calibration_record().get("template_sha256")
+    if isinstance(recorded, str) and SHA256_RE.fullmatch(recorded):
+        old.add(recorded)
+    old.discard(run.pins.template_sha256)
+    got = hashlib.sha256(zeroed).hexdigest()
+    return got if got in old else None
+
+
+def one_reader(run: Run) -> Reader:
+    readers = find_readers(run.cfg)
+    run.log.write("INFO", f"sysfs: {len(readers)} reader(s) 06cb:0078: {', '.join(r.name for r in readers) or '-'}")
+    if not readers:
+        raise Fail(MSG_NOT_FOUND)
+    if len(readers) > 1:
+        raise Fail(
+            f"{len(readers)} readers 06cb:0078 were found; this tool sets up one. Unplug the others, then run again."
+        )
+    reader = readers[0]
+    if not SERIAL_RE.fullmatch(reader.serial):
+        raise Fail(
+            "The reader's USB serial number cannot be read from sysfs, so its program cannot be named. "
+            "Restart the computer, then run the same command again."
+        )
+    run.redact.add_serial(reader.serial)
+    return reader
+
+
+# ------------------------------------------------------------- the calibration
+
+
+def systemctl(run: Run, *args: str) -> int | None:
+    argv = [run.cfg.systemctl, *args]
+    try:
+        r = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=SYSTEMCTL_TIMEOUT_S,
+            env=_ENV_MIN,
+            cwd="/",
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        run.log.write("WARN", f"systemctl {' '.join(args)}: {exc}")
+        return None
+    text = (r.stdout + r.stderr).decode("utf-8", "replace").strip()
+    run.log.write(
+        "INFO", f"systemctl {' '.join(args)}: exit {r.returncode}" + (f": {_safe(text, 300)}" if text else "")
+    )
+    return r.returncode
+
+
+def stop_fprintd(run: Run, again: bool = False) -> None:
+    """Stop fprintd if it is active (it is D-Bus activated and starts again on demand)."""
+    if not again:
+        if systemctl(run, "is-active", "--quiet", "fprintd") != 0:
+            return
+        systemctl(run, "stop", "fprintd")
+        run.say("Stopped fprintd for the calibration (it starts again by itself when needed).")
+        return
+    systemctl(run, "stop", "fprintd")
+
+
+def make_transport(run: Run, guard):
+    if run.cfg.transport_path:
+        if run._fake is None:
+            spec = importlib.util.spec_from_file_location("synaptics0078_setup_test_transport", run.cfg.transport_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            run._fake = module
+        return run._fake.make_transport(run.log, guard)
+    if run.cfg.test_root:
+        raise Fail(f"no fake transport under the test root (set {TEST_TRANSPORT_VAR}); nothing was calibrated", code=2)
+    return run.pk.session.UsbTransport(run.log, guard=guard)
+
+
+def open_failure(run: Run, exc) -> Fail:
+    s = run.pk.session
+    log = run.cfg.log_path
+    if exc.reason == "pyusb is missing":
+        return Fail("pyusb is not installed, so the reader cannot be used.", hint="sudo pacman -S python-pyusb")
+    if exc.rc == s.EXIT_NOT_FOUND and exc.reason == "reader not found":
+        return Fail(MSG_NOT_FOUND)
+    return Fail(f"{exc.user} Nothing was written.", hint=f"run again: {run.next_command()}   (log: {log})")
+
+
+def open_reader(run: Run, guard):
+    """Claim the reader; on busy stop fprintd once more, wait 1 s, retry once."""
+    s = run.pk.session
+    for attempt in (1, 2):
+        transport = make_transport(run, guard)
+        try:
+            transport.open()
+            return transport
+        except s.StepFailed as exc:
+            run.log.write("ERROR", f"opening the reader: {exc} ({exc.reason})")
+            with contextlib.suppress(Exception):
+                transport.close()
+            if exc.rc != s.EXIT_DRIVER_BUSY:
+                raise open_failure(run, exc) from None
+        if attempt == 2:
+            raise Fail(
+                "The reader is still in use by another program. Close every fingerprint prompt "
+                "(lock screen, login, settings), then run again.",
+                hint=run.next_command(),
+            )
+        run.log.write("INFO", f"the reader is busy: stopping fprintd once more, retrying in {BUSY_WAIT_S} s")
+        stop_fprintd(run, again=True)
+        sleep(BUSY_WAIT_S)
+    raise AssertionError("unreachable")
+
+
+def fingers_off(run: Run, first: bool) -> None:
+    if run.yes or not stdin_is_tty():
+        lead = "Keep your fingers OFF the reader" if first else "The reader seemed touched; lift your fingers"
+        run.say(f"{lead}; starting in {COUNTDOWN_S} seconds.")
+        sleep(COUNTDOWN_S)
+        return
+    run.say(MSG_FINGERS_OFF if first else MSG_TOUCHED)
+    if read_line() == "":
+        raise Fail("Cancelled (end of input); nothing was written.", hint=run.next_command())
+
+
+def sequence_class(session):
+    """CalibrationSequence that stops after the four reads when the module or the serial is wrong."""
+
+    class SetupSequence(session.CalibrationSequence):
+        expected_serial = ""
+
+        def read_identity(self):
+            out = super().read_identity()
+            u1 = self.state.rom_u1
+            if u1 not in (0, session.EXPECTED_BYTE17_AFTER_MODULE):
+                raise WrongModule(u1)
+            if serial_hex(self.rom_serial or b"") != self.expected_serial:
+                raise SerialMismatch()
+            return out
+
+    return SetupSequence
+
+
+def session_failure(run: Run, exc: BaseException) -> Fail:
+    """The user's line for an error inside the calibration sequence (details are in the log)."""
+    s, log, again = run.pk.session, run.cfg.log_path, run.next_command()
+    if isinstance(exc, WrongModule):
+        shown = "unknown" if exc.args[0] is None else f"0x{exc.args[0]:02x}"
+        run.log.write("ERROR", f"RomInfo byte 17 is {shown}: another capture module is loaded")
+        return Fail(
+            "Another capture module is loaded in the reader (for example after Windows used it), so nothing "
+            "was written. Restart the computer, then run again.",
+            hint=again,
+        )
+    if isinstance(exc, SerialMismatch):
+        run.log.write("ERROR", "the RomInfo serial differs from the sysfs USB serial")
+        return Fail(
+            "The reader reported a different serial number than the one seen on USB, so nothing was written. "
+            "Restart the computer, then run again.",
+            hint=again,
+        )
+    if isinstance(exc, s.UnsafeCommand):
+        run.log.write("ERROR", f"refused to send: {exc}")
+        return Fail(
+            f"Stopped before sending a command that is not allowed, so nothing was written (details in the log: {log}).",
+            hint="the vendor files or this tool do not match; report the log",
+        )
+    if isinstance(exc, s.StepFailed):
+        run.log.write("ERROR", f"{exc} ({exc.reason})")
+        return Fail(f"{exc.user} Nothing was written.", hint=f"run again: {again}   (log: {log})")
+    if isinstance(exc, s.DeviceError):
+        run.log.write("ERROR", f"USB error: {exc} (errno {exc.errno})")
+        user = s.MSG_REMOVED if exc.errno == s.ENODEV else s.MSG_DEVICE
+        return Fail(f"{user} Nothing was written.", hint=f"run again: {again}   (log: {log})")
+    if isinstance(exc, (s.TransferTimeout, run.pk.calibration.CalibrationError)):
+        run.log.write("ERROR", f"{type(exc).__name__}: {exc}")
+        return Fail(f"{s.MSG_DEVICE} Nothing was written.", hint=f"run again: {again}   (log: {log})")
+    raise exc
+
+
+def calibrate(run: Run, serial: str, template: bytes, module: bytes, label: str) -> tuple[bytes, dict]:
+    """The guarded calibration with retries; (the identify program, the calibration.json record)."""
+    pk, pins = run.pk, run.pins
+    s, cm = pk.session, pk.calib_model
+    guard = functools.partial(
+        s.check_command, module_sha256=pins.module_sha256, module_len=pins.module_len, skeletons=pins.skeletons
+    )
+    Sequence = sequence_class(s)
+    stop_fprintd(run)
+    transport = open_reader(run, guard)
+    try:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            fingers_off(run, first=attempt == 1)
+            run.begin("Calibrating... ")
+            run.log.write("INFO", f"calibration attempt {attempt} of {MAX_ATTEMPTS}")
+            seq = Sequence(
+                transport,
+                run.log,
+                template=template,
+                module=module,
+                guard=guard,
+                say=lambda text: run.log.write("STEP", text),
+            )
+            seq.expected_serial = serial
+            try:
+                res = seq.calibrate()
+            except BaseException as exc:
+                if isinstance(exc, s.DeviceError) and exc.errno == s.ENODEV:
+                    seq.device_gone = True
+                seq.cleanup()
+                with contextlib.suppress(OSError):  # the terminal may be gone (SIGHUP)
+                    run.finish("stopped.")
+                if isinstance(exc, Exception):
+                    raise session_failure(run, exc) from None
+                raise
+            seq.cleanup()
+            if res.bf is None:
+                run.log.write("INFO", f"check score {res.score} > {cm.CHECK_MAX}: touched")
+                run.finish("the reader seemed touched.")
+                continue
+            good, mean, sd = cm.bf_sanity(res.bf)
+            run.log.write(
+                "INFO", f"check score {res.score}; BF mean {mean:.2f}, sd {sd:.2f} ({'ok' if good else 'out of range'})"
+            )
+            if not good:
+                run.finish("the reader seemed touched.")
+                continue
+            program = pk.calibration.assemble_cmd02(template, res.chunks())
+            fine, why = pk.template.program_matches_template(program, pins=pins)
+            if not fine:
+                raise Fail(
+                    f"The program built from the calibration does not match the template ({why}); nothing was written."
+                )
+            run.finish("done.")
+            record = {
+                "format": 1,
+                "tool": PROG,
+                "tool_version": TOOL_VERSION,
+                "date": now_iso(),
+                "how": "calibrated",
+                "check_score": res.score,
+                "check_max": cm.CHECK_MAX,
+                "bf_mean": round(mean, 2),
+                "bf_sd": round(sd, 2),
+                "attempts": attempt,
+                "module_uploaded": bool(res.module_uploaded),
+                "template_sha256": pins.template_sha256,
+                "vendor_files": label,
+            }
+            return program, record
+        raise Fail(
+            f"The reader seemed touched in {MAX_ATTEMPTS} attempts, so nothing was written. Wipe the reader, "
+            "keep your fingers off it, then run again.",
+            hint=run.next_command(),
+        )
+    finally:
+        transport.close()
+
+
+def resplice(run: Run, old_program: bytes, template: bytes) -> tuple[bytes, dict]:
+    """The installed program's per-unit regions in the new template (no calibration)."""
+    pk = run.pk
+    try:
+        program = pk.calibration.assemble_cmd02(template, pk.calibration.unit_regions(old_program))
+    except pk.calibration.CalibrationError as exc:
+        raise Fail(
+            f"The installed program cannot be moved to the new template ({exc}).", hint=f"sudo {PROG} recalibrate"
+        ) from None
+    fine, why = pk.template.program_matches_template(program, pins=run.pins)
+    if not fine:
+        raise Fail(f"The re-spliced program does not match the template ({why}).", hint=f"sudo {PROG} recalibrate")
+    record = run.calibration_record()
+    record.update(
+        format=1,
+        tool=PROG,
+        tool_version=TOOL_VERSION,
+        how=record.get("how", "re-spliced"),
+        resplice_date=now_iso(),
+        template_sha256=run.pins.template_sha256,
+    )
+    record.setdefault("date", record["resplice_date"])
+    return program, record
+
+
+def backup_program(run: Run, serial: str, data: bytes) -> str:
+    fd = run.open_setup_dir(BACKUP_NAME)
+    try:
+        stamp = datetime.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+        name, n = program_name(f"{serial}-{stamp}"), 1
+        while os.path.lexists(os.path.join(run.backup_dir, name)):
+            n += 1
+            name = program_name(f"{serial}-{stamp}-{n}")
+        write_atomic(fd, name, data, run.cfg)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    run.log.write("INFO", f"previous program kept as {run.backup_dir}/{name}")
+    return name
+
+
+def write_data_files(run: Run, serial: str, module: bytes, program: bytes) -> None:
+    """module.bin and program-<serial>.bin through the phase A planner and atomic writer; lines to the log."""
+    ds = DataSet(origin=PROG, module=module, programs={serial: program})
+    with contextlib.redirect_stdout(LogLines(run.log)):
+        plan = make_plan(run.cfg, ds, force=True, dry_run=False)
+        if plan.refusals:
+            raise Fail("Nothing was installed: " + "; ".join(plan.refusals))
+        carry_out(plan, run.cfg)
+
+
+def show_setup_plan(run: Run, files, inst: Installed, need_module_file: bool, action: str | None) -> None:
+    say("dry run: nothing is changed")
+    if inst.unreadable:
+        say(
+            f"  note  cannot look inside {run.cfg.state_dir} as {user_name(os.geteuid())} (root only): assuming nothing is installed"
+        )
+    if need_module_file or action:
+        if files:
+            say("  would read the vendor files from: " + ", ".join(os.path.abspath(f) for f in files))
+        else:
+            first = run.archives[0].label if run.archives else "none"
+            say(f"  would use the vendor files saved in {run.vendor_dir}, else download them ({first} first)")
+    if action == "calibrate":
+        say("  would stop fprintd if it runs, and calibrate the reader (fingers off, about 10 seconds)")
+    elif action == "resplice":
+        say("  would move this reader's program to the new template (no calibration)")
+    if need_module_file:
+        say(f"  would install {MODULE_NAME} into {run.cfg.data_dir}")
+    if action:
+        say(f"  would install this reader's program into {run.cfg.data_dir}")
+    say(f"dry run: nothing was changed; run the same command without --dry-run: sudo {PROG} {run.command}")
+
+
+def preflight_dirs(run: Run, serial: str) -> None:
+    """Refuse a symlinked or foreign target directory, or a symlinked (or not regular) module.bin
+    or program of this reader, before any download or USB use: the write would refuse them after
+    the calibration."""
+    cfg = run.cfg
+    for path in (cfg.state_dir, cfg.data_dir, cfg.setup_dir, run.vendor_dir, run.backup_dir):
+        st = lstat_or_none(path)
+        if st is not None and (why := dir_refusal(path, st, cfg)):
+            raise Fail(f"Nothing was installed: {why}")
+    for name in (MODULE_NAME, program_name(serial)):
+        path = os.path.join(cfg.data_dir, name)
+        st = lstat_or_none(path)
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            raise Fail(f"Nothing was installed: {path} is a symlink; refusing to replace or follow it")
+        if st is not None and not stat.S_ISREG(st.st_mode):
+            raise Fail(f"Nothing was installed: {path} exists and is not a regular file")
+
+
+def needs_root(cfg: Config, command: str, files: list[str], dry_run: bool) -> None:
+    if not cfg.test_root and os.geteuid() != 0 and not dry_run:
+        line = f"sudo {PROG} {command}" + "".join(f" --from-file {shlex.quote(os.path.abspath(f))}" for f in files)
+        raise Fail(f"{command} needs root; nothing was changed. Run:\n  {line}", code=2)
+
+
+def cmd_setup(cfg: Config, command: str, files: list[str], dry_run: bool, yes: bool) -> int:
+    """install (no --from) and recalibrate."""
+    needs_root(cfg, command, files, dry_run)
+    run = Run(cfg, load_package(cfg), command, dry_run=dry_run, yes=yes)
+    with run.logged():
+        reader = one_reader(run)
+        run.say(MSG_FOUND)
+        serial = reader.serial
+        if not dry_run:
+            preflight_dirs(run, serial)
+        inst = inspect_installed(run, serial)
+        if command == "install" and inst.module is not None and inst.program_ok:
+            if not dry_run:
+                write_data_files(run, serial, inst.module, inst.program)  # only fixes a loose mode, if any
+            run.say(
+                "Already set up: the module and this reader's program are installed and valid. "
+                "Enroll a finger with: fprintd-enroll"
+            )
+            return 0
+        need_module_file = inst.module is None
+        if command == "recalibrate":
+            action = "calibrate"
+        elif inst.program_ok:
+            action = None
+        elif inst.program is not None and resplice_pin(run, inst.program):
+            action = "resplice"
+        else:
+            action = "calibrate"
+        run.log.write("INFO", f"module.bin {'needed' if need_module_file else 'valid'}; program: {action or 'valid'}")
+        if dry_run:
+            show_setup_plan(run, files, inst, need_module_file, action)
+            return 0
+        need_template = action is not None
+        need_module = need_module_file or action == "calibrate"
+        g = Gathered(module=inst.module)
+        if not g.satisfied(need_module, need_template):
+            g = acquire(run, files, inst.module, need_module, need_template)
+        module = g.module
+        if action == "calibrate":
+            program, record = calibrate(run, serial, g.template, module, g.label or "installed module")
+        elif action == "resplice":
+            run.begin("Moving this reader's program to the new template... ")
+            program, record = resplice(run, inst.program, g.template)
+            run.finish("done.")
+        else:
+            program, record = inst.program, None
+        kept = None
+        if inst.program is not None and (program != inst.program or command == "recalibrate"):
+            kept = backup_program(run, serial, inst.program)
+        write_data_files(run, serial, module, program)
+        if record is not None:
+            run.write_calibration_record(record)
+        if command == "recalibrate" and kept:
+            run.say(f"The previous program was kept in {run.backup_dir}.")
+        elif kept and action == "calibrate":
+            run.say(f"The previous program was not valid; it was kept in {run.backup_dir}.")
+        run.say(f"Ready. Enroll a finger with: fprintd-enroll   (log: {cfg.log_path})")
+    return 0
+
+
+def cmd_fetch(cfg: Config, files: list[str], dry_run: bool) -> int:
+    """The vendor files into the cache only; no reader needed."""
+    needs_root(cfg, "fetch", files, dry_run)
+    run = Run(cfg, load_package(cfg), "fetch", dry_run=dry_run)
+    with run.logged():
+        if dry_run:
+            say("dry run: nothing is changed")
+            if files:
+                say("  would read and save: " + ", ".join(os.path.abspath(f) for f in files))
+            else:
+                say(f"  would check the vendor files saved in {run.vendor_dir}, else download them")
+            say(f"dry run: nothing was changed; run the same command without --dry-run: sudo {PROG} fetch")
+            return 0
+        g = Gathered()
+        if files:
+            gather_from_files(run, files, g, False, False)  # keep whatever each file gives
+            if g.module is None and g.template is None:
+                raise Fail(
+                    "The files given contain neither the module nor the DLL tables, so nothing was saved.",
+                    hint=f"use one of the archives {PROG} status lists: sudo {PROG} fetch --from-file FILE",
+                )
+            if g.template is None:
+                run.say("Saved. Note: " + MSG_BARE_MODULE)
+        else:
+            tried: set = set()
+            if gather_from_cache(run, g, True, True, tried):
+                run.say("Nothing to download: the vendor files are already saved.")
+                return 0
+            gather_from_network(run, g, True, True, tried)
+        run.say(f"Saved in {run.vendor_dir}; sudo {PROG} install now works without the network.")
+    return 0
+
+
+# ----------------------------------------------------------------------- status
+
+
+def status_sources(run: Run) -> None:
+    print("vendor file sources (tried in this order; for --from-file any one of them will do):")
+    for i, a in enumerate(run.archives, 1):
+        print(f"  {i}. {a.label}: {a.url}")
+
+
+def status_reader(run: Run) -> tuple[Reader | None, bool]:
+    """(the one reader, whether the reader side is fine): no reader at all is a note, not a failure."""
+    print("reader:")
+    readers = find_readers(run.cfg)
+    if not readers:
+        note("no 06cb:0078 reader found in sysfs (is it enabled in the firmware setup?): programs not matched to it")
+        return None, True
+    if len(readers) > 1:
+        failed(f"{len(readers)} readers 06cb:0078 found; this tool sets up one (unplug the others)")
+        return None, False
+    reader = readers[0]
+    if not SERIAL_RE.fullmatch(reader.serial):
+        failed("06cb:0078 found, but its USB serial number cannot be read (restart the computer)")
+        return None, False
+    ok("06cb:0078 found (USB serial readable)")
+    return reader, True
+
+
+def status_setup_dir(run: Run) -> None:
+    """The vendor cache and the last calibration (information; not part of ready)."""
+    cfg = run.cfg
+    print(f"vendor files saved in {run.vendor_dir}:")
+    try:
+        st = os.lstat(cfg.setup_dir)
+        fd = os.open(cfg.setup_dir, _DIR_FLAGS) if stat.S_ISDIR(st.st_mode) else None
+    except FileNotFoundError:
+        note(f"nothing saved yet: install downloads them (or ahead of time: sudo {PROG} fetch)")
+        return
+    except PermissionError:
+        note(f"readable by root only; to see it: sudo {PROG} status")
+        return
+    if fd is None:
+        failed(f"{cfg.setup_dir} is not a directory")
+        return
+    try:
+        try:
+            vfd = os.open(VENDOR_NAME, _DIR_FLAGS, dir_fd=fd)
+        except FileNotFoundError:
+            vfd = None
+            note(f"nothing saved yet: install downloads them (or ahead of time: sudo {PROG} fetch)")
+        except OSError as exc:
+            vfd = None
+            failed(f"cannot look inside: {exc.strerror}")
+        if vfd is not None:
+            try:
+                manifest = run.read_json_at(vfd, MANIFEST_NAME)
+                names = cache_names(run, vfd)
+                for name in names:
+                    entry = manifest.get(name) if isinstance(manifest.get(name), dict) else {}
+                    gave = entry.get("gave") if isinstance(entry.get("gave"), list) else []
+                    gave_s = " and ".join(_safe(x, 20) for x in gave) or "not recorded"
+                    when = _safe(entry.get("date", "date not recorded"), 40)
+                    ok(f"{entry_label(run, name, manifest)} ({_safe(name[65:], 40)}): gave {gave_s}; saved {when}")
+                if not names:
+                    note(f"nothing saved yet: install downloads them (or ahead of time: sudo {PROG} fetch)")
+            finally:
+                os.close(vfd)
+        record = run.read_json_at(fd, CALIBRATION_NAME)
+        if record:
+            score, bf = record.get("check_score"), (record.get("bf_mean"), record.get("bf_sd"))
+            text = f"last calibration: {_safe(record.get('date', '?'), 40)}"
+            if isinstance(score, int):
+                text += f", check score {score} (limit {record.get('check_max', 200)})"
+            if all(isinstance(x, int | float) for x in bf):
+                text += f", baseline mean {bf[0]:.1f}, sd {bf[1]:.1f}"
+            if record.get("resplice_date"):
+                text += f"; moved to the current template {_safe(record['resplice_date'], 40)}"
+            print(text)
+    finally:
+        os.close(fd)
+
+
+def cmd_status(cfg: Config) -> int:
+    me = user_name(os.geteuid())
+    print(f"{PROG} status (as {me})" + (f" (TEST ROOT {cfg.test_root})" if cfg.test_root else ""))
+    run = Run(cfg, load_package(cfg), "status")
+    status_sources(run)
+    reader, reader_ok = status_reader(run)
+    if reader is not None:
+        run.redact.add_serial(reader.serial)
+    print(f"data directory: {cfg.data_dir}")
+    try:
+        st = os.lstat(cfg.data_dir)
+        if stat.S_ISDIR(st.st_mode):
+            os.close(os.open(cfg.data_dir, _DIR_FLAGS))  # can we list it?
+    except FileNotFoundError:
+        failed("missing: nothing is installed yet")
+        print(f"  install with: sudo {PROG} install")
+        print(f"  (or from files made on Windows: sudo {PROG} install --from DIR")
+        print(f"   DIR: {SOURCE_HINT})")
+        return 1
+    except PermissionError:
+        print(f"  {cfg.state_dir} is readable by root only, so {me} cannot see inside it. Run:")
+        print(f"    sudo {PROG} status")
+        return 1
+    good = reader_ok
+    if stat.S_ISLNK(st.st_mode):
+        failed("is a symlink; the driver needs a real directory")
+        return 1
+    if not stat.S_ISDIR(st.st_mode):
+        failed("exists and is not a directory")
+        return 1
+    mode = stat.S_IMODE(st.st_mode)
+    where = f"owner {user_name(st.st_uid)}:{group_name(st.st_gid)}, mode {mode:04o}"
+    if st.st_uid != cfg.expect_uid:
+        failed(f"{where}: expected owner {user_name(cfg.expect_uid)}")
+        good = False
+    elif mode != DIR_MODE:
+        failed(f"{where}: expected mode 0700 (install sets it)")
+        good = False
+    else:
+        ok(f"exists, {where}")
+
+    ds = load_from_dir(cfg.data_dir)
+    valid_programs = set()
+    for check in check_dataset(ds, cfg):
+        problem = check.problem
+        match = PROGRAM_NAME_RE.fullmatch(check.name)
+        if problem is None and match and match.group(1) in ds.programs:
+            problem = program_check(run, match.group(1), ds.programs[match.group(1)])
+        if problem is None:
+            if attrs := file_attr_problem(ds.stats[check.name], cfg):
+                failed(f"{check.name}: valid, but {attrs}: expected mode 0600, {owner_text(cfg)} (install sets it)")
+                good = False
+            else:
+                extra = ", matches the template" if match and cfg.check_template else ""
+                ok(f"{check.name}: valid ({describe_ok(check.name)}{extra})")
+                if match:
+                    valid_programs.add(match.group(1))
+        elif check.present:
+            failed(f"{check.name}: invalid: it {problem}")
+            good = False
+        else:
+            failed(f"{check.name}: missing")
+            good = False
+    for name in ds.others:
+        note(f"other file (not used by the driver): {name}")
+    if reader is not None:
+        if reader.serial in valid_programs:
+            ok("this reader's program is installed and valid")
+        else:
+            failed(f"this reader has no valid program: sudo {PROG} install")
+            good = False
+    status_setup_dir(run)
+    if good:
+        print("ready: the driver finds valid data files")
+        return 0
+    print(f"not ready: see the FAILED lines above; fix with: sudo {PROG} install")
+    return 1
+
+
+# ------------------------------------------------------------------------- main
+
+
+def build_parser() -> argparse.ArgumentParser:
+    fmt = argparse.RawDescriptionHelpFormatter
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        formatter_class=fmt,
+        description=(
+            "Set up and check the data files of the libfprint synaptics0078 driver\n"
+            f"(Synaptics 06cb:0078 fingerprint reader) in {DATA_DIR}."
+        ),
+        epilog=(
+            "Usual use (downloads the public vendor files, calibrates the reader, installs):\n"
+            f"  sudo {PROG} install\n"
+            f"  {PROG} status\n"
+            "Offline: download a vendor archive elsewhere (status lists the URLs), then\n"
+            f"  sudo {PROG} install --from-file FILE\n"
+            "Files made on Windows (phase A): tools/synaptics0078_data.py in the\n"
+            "fingerprint-06cb-0078 project builds module.bin and program-<serial>.bin from\n"
+            "the Windows driver files (run it as your user; it writes local/synaptics0078). Then:\n"
+            f"  sudo {PROG} install --from <that directory>"
+        ),
+    )
+    sub = p.add_subparsers(dest="command", required=True, metavar="{install,recalibrate,fetch,status}")
+
+    def common(sp, yes: bool = True):
+        sp.add_argument(
+            "--from-file",
+            dest="from_files",
+            metavar="FILE",
+            action="append",
+            default=[],
+            help="vendor file to use instead of the cache and the download (cab, zip, exe, MSI, DLL, "
+            "module, template); repeatable",
+        )
+        sp.add_argument(
+            "--dry-run", action="store_true", help="print what would be done, change nothing (no root needed)"
+        )
+        if yes:
+            sp.add_argument(
+                "--yes", action="store_true", help="no Enter prompt: a 3-second countdown before calibrating"
+            )
+
+    inst = sub.add_parser(
+        "install",
+        formatter_class=fmt,
+        help="set up whatever is missing: vendor files, calibration, data files (as root)",
+        description=(
+            f"Without --from: find the reader, get the vendor files (cache in {SETUP_DIR}/vendor,\n"
+            "else download, or --from-file), calibrate the reader (fingers off) and install\n"
+            f"module.bin and program-<serial>.bin into {DATA_DIR}.\n"
+            "Already set up (valid module, valid program for this reader): nothing is done.\n\n"
+            f"With --from DIR: check the files in DIR, then copy them into {DATA_DIR}\n"
+            "(directory 0700, files 0600, root:root). Nothing is written unless every\n"
+            "file is valid, and nothing is ever deleted. An installed program that\n"
+            "differs is kept unless --force is given."
+        ),
+    )
+    inst.add_argument(
+        "--from", dest="source", metavar="DIR", help="directory with data files made on Windows (phase A)"
+    )
+    inst.add_argument("--force", action="store_true", help="with --from: replace an installed program that differs")
+    common(inst)
+    rec = sub.add_parser(
+        "recalibrate",
+        formatter_class=fmt,
+        help="calibrate the reader again (the previous program is kept)",
+        description=f"Calibrate the reader again and install the new program; the previous one is kept in\n{SETUP_DIR}/backup.",
+    )
+    common(rec)
+    fetch = sub.add_parser(
+        "fetch",
+        formatter_class=fmt,
+        help="get the vendor files into the cache only (no reader needed)",
+        description=f"Get and check the vendor files, and keep them in {SETUP_DIR}/vendor\nso a later install works offline.",
+    )
+    common(fetch, yes=False)
+    sub.add_parser(
+        "status",
+        help="show what is installed (sudo shows inside /var/lib)",
+        description=f"Show {DATA_DIR}, the reader, the cache and the sources.\nExit 0 when the driver can use the files, else 1.",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None, environ=None) -> int:
+    environ = os.environ if environ is None else environ
+    _pending[0] = False
+    try:
+        cfg = load_config(environ, os.geteuid())
+        args = build_parser().parse_args(argv)
+        if args.command == "install" and args.source is not None:
+            if args.from_files:
+                raise Fail("--from and --from-file cannot be combined", code=2)
+            return cmd_install(cfg, args.source, args.force, args.dry_run)
+        if getattr(args, "force", False):
+            raise Fail("--force applies only to install --from DIR", code=2)
+        if args.command in ("install", "recalibrate"):
+            return cmd_setup(cfg, args.command, args.from_files, args.dry_run, args.yes)
+        if args.command == "fetch":
+            return cmd_fetch(cfg, args.from_files, args.dry_run)
+        return cmd_status(cfg)
+    except Fail as exc:
+        end_pending_line()
+        sys.stdout.flush()
+        print(f"FAILED: {exc}", file=sys.stderr)
+        if exc.hint:
+            print(f"  hint: {exc.hint}", file=sys.stderr)
+        return exc.code
+    except KeyboardInterrupt:
+        with contextlib.suppress(OSError):  # the terminal may be gone (SIGHUP)
+            end_pending_line()
+            sys.stdout.flush()
+            print("Interrupted. Nothing more was written.", file=sys.stderr)
+        return 130
+    except OSError as exc:
+        end_pending_line()
+        sys.stdout.flush()
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+
+
+# SIGTERM (systemd, kill) and SIGHUP (the terminal closed, relayed by sudo too) stop the
+# run like Ctrl-C: the reader gets its 04/52 and is released, nothing more is written.
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
+def _on_stop_signal(signum, frame):
+    # Once is enough: a second one (the kernel's hangup and sudo's relayed copy) must not
+    # cut the cleanup that the first one started short.
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
+def install_signal_handlers() -> None:
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, _on_stop_signal)
+
+
+if __name__ == "__main__":
+    os.umask(0o077)  # belt and braces: every mode is also set explicitly
+    install_signal_handlers()
+    sys.exit(main())

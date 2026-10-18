@@ -1,0 +1,74 @@
+SPDX-License-Identifier: LGPL-2.1-or-later
+
+This is a patch to libfprint (LGPL-2.1-or-later); like libfprint it is under
+LGPL-2.1-or-later, not this project's MIT.
+
+diff --git i/libfprint/drivers/virtual-image.c w/libfprint/drivers/virtual-image.c
+index 97eebc9..25b95cf 100644
+--- i/libfprint/drivers/virtual-image.c
++++ w/libfprint/drivers/virtual-image.c
+@@ -28,6 +28,8 @@
+ #define FP_COMPONENT "virtual_image"
+ 
+ #include "fpi-log.h"
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "virtual-device-private.h"
+ 
+@@ -71,6 +73,29 @@ recv_image_img_recv_cb (GObject      *source_object,
+   self = FPI_DEVICE_VIRTUAL_IMAGE (user_data);
+   device = FP_IMAGE_DEVICE (self);
+ 
++  /* EVAL PATCH (matcher evaluation only): mimic what a native image driver
++   * does to its frame before handing it over (egis0570, elanspi):
++   * FP_VIRTUAL_IMAGE_FLAGS=partial,inverted and FP_VIRTUAL_IMAGE_RESIZE=N
++   * (fpi_image_resize, pixman bilinear). */
++  {
++    const char *s;
++
++    if ((s = g_getenv ("FP_VIRTUAL_IMAGE_FLAGS")) != NULL)
++      {
++        if (strstr (s, "partial"))
++          self->recv_img->flags |= FPI_IMAGE_PARTIAL;
++        if (strstr (s, "inverted"))
++          self->recv_img->flags |= FPI_IMAGE_COLORS_INVERTED;
++      }
++    if ((s = g_getenv ("FP_VIRTUAL_IMAGE_RESIZE")) != NULL && atoi (s) > 1)
++      {
++        FpImage *resized = fpi_image_resize (self->recv_img, atoi (s), atoi (s));
++
++        g_object_unref (self->recv_img);
++        self->recv_img = resized;
++      }
++  }
++
+   if (self->automatic_finger)
+     fpi_image_device_report_finger_status (device, TRUE);
+   fpi_image_device_image_captured (device, g_steal_pointer (&self->recv_img));
+diff --git i/meson.build w/meson.build
+index ab09dc1..c53b456 100644
+--- i/meson.build
++++ w/meson.build
+@@ -152,7 +152,7 @@ drivers_info = {
+     'elanspi': { 'spi': true, 'helper': ['udev'], 'optional': not have_spi },
+ 
+     # Virtual drivers (test-only, optional)
+-    'virtual_image': { 'virtual': true, 'helper': ['virtual'], 'optional': true },
++    'virtual_image': { 'virtual': true, 'helper': ['virtual', 'pixman'], 'optional': true },
+     'virtual_device': { 'virtual': true, 'helper': ['virtual'], 'optional': true },
+     'virtual_device_storage': { 'virtual': true, 'helper': ['virtual'], 'optional': true },
+ }
+diff --git i/tests/meson.build w/tests/meson.build
+index aad0675..32c7685 100644
+--- i/tests/meson.build
++++ w/tests/meson.build
+@@ -292,7 +292,7 @@ else
+         args: ['-c', 'exit 77']
+     )
+ 
+-    foreach driver_test: drivers_tests
++    foreach driver_test, _unused: drivers_tests
+         test(driver_test,
+             sh,
+             args: ['-c', 'exit 77']

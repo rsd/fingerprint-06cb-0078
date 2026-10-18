@@ -1,0 +1,43 @@
+# Proprietary Synaptics driver files and data derived from them
+driverstore/
+installed/
+extracted/
+proto/data/
+
+# Per-machine Windows data: registry exports, event logs, calibration
+registry/
+logs/
+programdata/
+
+# Our unit's calibration, built from the decrypted CalibrationData
+research/calib/ours_cmd02.bin
+proto/testdata/ours_cmd02.bin
+
+# Third-party payloads (other projects' recorded 02 commands: vendor tables plus
+# another unit's calibration), kept local; their tests skip when they are absent
+proto/testdata/iusearch_cmd02.bin
+proto/testdata/toliknosov_cmd02.bin
+proto/testdata/toliknosov_cmd03.bin
+
+# Raw per-unit Windows/USB dumps (they embed the unit serial or owner data):
+# kept on disk, never tracked
+/lsusb*.txt
+/pnp_properties.txt
+/system_info.txt
+/usb_capture/etw_sensor_events.xml
+/usb_capture/etw_sensor_summary.txt
+
+# Biometric captures and device session logs
+proto/captures/
+proto/logs/
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Dev data dir of the libfprint driver (module + per-unit program, written by
+# tools/synaptics0078_data.py) and the hardware-check logs of tools/dev/: per
+# unit and proprietary
+local/
