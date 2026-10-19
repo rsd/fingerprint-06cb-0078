@@ -4,9 +4,54 @@ Laptop: Clevo P870KM. Sensor: "Synaptics WBDI Fingerprint Reader - USB 073".
 USB ID 06cb:0078, rev 0154, vendor class 0xFF. Internal USB.
 
 ## Install (Arch Linux, Omarchy)
-1. Build and install the package `libfprint-sigfm-0078` from the AUR: `git clone https://aur.archlinux.org/libfprint-sigfm-0078.git && cd libfprint-sigfm-0078 && makepkg -si` (or use an AUR helper). It replaces Arch's `libfprint`; see "libfprint driver: switch to the package (A6)" for what pacman asks.
-2. With fingers off the reader: `sudo synaptics0078-setup install`. No Windows is needed; see "Setup without Windows (B5)".
-3. Enroll: `fprintd-enroll`. Read the false-accept limits in "False-accept benchmark (B3)" before using the finger for sudo, polkit or the lock screen.
+The package `libfprint-sigfm-0078` is on the AUR, not in the pacman repositories: https://aur.archlinux.org/packages/libfprint-sigfm-0078. It replaces Arch's `libfprint` (it provides `libfprint` and `libfprint-git`, and conflicts with both). pacman or yay asks to remove whichever of the two is installed: answer yes. See "libfprint driver: switch to the package (A6)" for what pacman asks. The package does not depend on `fprintd`, so install that too.
+
+Before you use the finger for sudo, polkit or the lock screen, read the false-accept limits in "False-accept benchmark (B3)". Setup needs no Windows; "Setup without Windows (B5)" says what it does.
+
+### Omarchy
+Omarchy ships `yay`. Run these in order, with your fingers off the reader for the second command:
+
+```sh
+yay -S libfprint-sigfm-0078 fprintd usbutils
+sudo synaptics0078-setup install      # fingers off the reader
+omarchy-setup-security-fingerprint    # enrolls, verifies, then sets up sudo, polkit and the lock screen
+```
+
+`fprintd` and `usbutils` go in the same command on purpose. Omarchy's own fingerprint setup installs its `libfprint-git`, `fprintd` and `usbutils` if any of the three is missing, and that would replace this package. With all three present it installs nothing: it enrolls a finger, checks it, and only after a verified print sets up the fingerprint for sudo, polkit and the lock screen. It does not ask first. Read "False-accept benchmark (B3)" before the third command. If you do not want all three, skip it and run `fprintd-enroll` instead.
+
+Omarchy's fingerprint removal (`omarchy-remove-security-fingerprint`) removes its PAM lines and `fprintd` but keeps this package. Before you run its setup again, reinstall `fprintd` (`sudo pacman -S fprintd`); otherwise the setup installs its `libfprint-git` over this package without asking.
+
+The setup finds this reader by its vendor ID. Omarchy's first-run notification runs the same setup: use it only after the first two commands.
+
+### Arch Linux
+With an AUR helper:
+
+```sh
+yay -S libfprint-sigfm-0078 fprintd
+```
+
+Without one:
+
+```sh
+git clone https://aur.archlinux.org/libfprint-sigfm-0078.git
+cd libfprint-sigfm-0078
+makepkg -si
+sudo pacman -S --needed fprintd
+```
+
+Then, with your fingers off the reader, run `sudo synaptics0078-setup install`, and enroll with `fprintd-enroll`. To use the finger at the login screen, see "Fingerprint at the SDDM login screen".
+
+### Going back
+`sudo pacman -S libfprint`. pacman asks to remove this package. Prints enrolled with this reader will not work with stock libfprint, and Omarchy's PAM lines stay until you run its removal.
+
+## Why a libfprint fork?
+The package is built from [a fork of libfprint](https://github.com/rsd/libfprint) (branch `sigfm-0078`). Three things are missing upstream:
+
+- **A driver and a matcher.** libfprint has no driver for 06cb:0078. The reader returns a 144x56 pixel image. libfprint's matcher (NBIS) rejected every genuine attempt in our tests (research/matcher-evaluation.md), while keypoint matchers told fingers apart. The fork carries SIGFM, proposed upstream in [MR !530](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/530) and not merged.
+- **Per-device data.** The reader keeps its vendor firmware module only in RAM, so it is lost on reboot and the driver sends it again when it is missing. A per-unit capture program goes with every capture. Neither is shipped inside libfprint (one is proprietary, the other unique to each unit), and libfprint has no place yet for per-device data ([issue #868](https://gitlab.freedesktop.org/libfprint/libfprint/-/issues/868), [MR !368](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/368)). This project's setup builds that data on your machine.
+- **One small core fix.** An enrollment that finishes while the reader still waits for the finger to lift raised a spurious warning; the fork fixes it in `libfprint/fpi-image-device.c`.
+
+The fork is meant to be a drop-in. It is based on upstream master 6f9479c3 (current as of October 2026) and removes no upstream driver, feature or public function. The library name, soname and version are unchanged (`libfprint-2.so.2`, 1.94.100), and no upstream public function or symbol is changed or removed (the fork only adds two SIGFM image helpers), so fprintd works unchanged. Other readers keep NBIS; only `synaptics0078` selects SIGFM. The package builds all upstream drivers and runs the upstream test suite (egis_etu905, a known upstream flake, is rerun up to three times when it is the only failure).
 
 The rest of this file is the project log: the Windows collection, then each development step.
 
@@ -240,9 +285,11 @@ Data files on another machine, or later:
 - Then `sudo synaptics0078-setup install --from local/synaptics0078`. `--force` replaces a file that differs; `--dry-run` only prints what it would do.
 - fprintd reads the files at the next device open: no restart.
 
+*Update: superseded by "Install (Arch Linux, Omarchy)" at the top, which runs Omarchy's setup safely once `fprintd` and `usbutils` are installed. The lock-screen and Remove-then-Setup notes below still apply.*
+
 **Warning: do NOT run Omarchy's "Setup Fingerprint" (`omarchy-setup-security-fingerprint`) for now.**
 - With this package it no longer swaps the library (the package provides `libfprint-git`, which is what it checks).
-- But after enrolling it turns fingerprint on for the lock screen (`/etc/pam.d/omarchy-lock-fingerprint`) without asking. Decide that yourself, knowing the false-accept limits below (B3: one person tested). It also enrolls the right index finger again.
+- But after enrolling it turns fingerprint on for sudo, polkit and the lock screen (`/etc/pam.d/omarchy-lock-fingerprint`) without asking. Decide that yourself, knowing the false-accept limits below (B3: one person tested). It also enrolls the right index finger again.
 - Do not run "Remove Fingerprint" and then "Setup Fingerprint" either: removal uninstalls fprintd, and the next setup would then install Omarchy's `libfprint-git` over this package without asking (`--ask 4`).
 
 Going back to the stock library: `sudo pacman -S libfprint`, and answer y to removing `libfprint-sigfm-0078`. If no stock package is in the pacman cache, it downloads one. The stock library has no driver for this reader; the data files and enrolled fingers stay on disk.
@@ -432,6 +479,12 @@ Upgrading the package (fingers off the reader during steps 3 and 4):
 
 ## libfprint driver: replay test (A7)
 `tests/synaptics0078/` in the fork is a synthesized umockdev pcapng replay test. It runs in `meson test` and in the package `check()`, and you do nothing. It covers open with a bad and a good module, capture, an 18-stage enroll with the error and retry cases, a matching and a non-matching verify, and close. The trace is generated (serial, module, program and images are synthetic, nothing is recorded from a device), and the driver accepts the synthetic module hash only in emulation mode. Under a test wrapper such as valgrind the probe window is widened and the test needs a timeout multiplier (about 127 s).
+
+## Acknowledgements
+- SIGFM, the matcher: copyright 2022 Matthieu Charette, Natasha England-Elbro and Timur Mangliev. Natalie Klestrup Röijezon first carried it toward libfprint, and Tooniis wrote the merge request (MR !530) that proposes it upstream.
+- Sergey Subbotin, whose SIGFM branch the fork is based on, and Omkar Chandorkar (gallery fix).
+- The libfprint project and its contributors.
+- [python-validity](https://github.com/uunicorn/python-validity) by uunicorn (MIT): `bitpack()` in `synaptics0078/calibration.py` and `research/calib/build_ours.py`, and the parts of `research/matcher/preprocess.py` and `research/matcher/sift_matcher.py` taken from PR #288 by ashh87.
 
 ## License
 - This project's own code is licensed under the MIT License (SPDX `MIT`). `LICENSE` holds the MIT text.
